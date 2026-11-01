@@ -29,7 +29,7 @@ from typing import Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
 APP_NAME = "DotClaude"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 DOCS = "https://code.claude.com/docs/en/"
 MAX_READ_BYTES = 10 * 1024 * 1024
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -1410,8 +1410,9 @@ GUIDANCE = {
     "memory": ("CLAUDE.md, rules and memory", "https://code.claude.com/docs/en/memory.md"),
     "best": ("Claude Code best practices", "https://code.claude.com/docs/en/best-practices.md"),
     "skills": ("Skills in Claude Code", "https://code.claude.com/docs/en/skills.md"),
+    # The .md form: the HTML page changes on every fetch (checked 2026-11-01), the .md form doesn't
     "skills_bp": ("Skill authoring best practices",
-                  "https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices"),
+                  "https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices.md"),
     "agents": ("Subagents", "https://code.claude.com/docs/en/sub-agents.md"),
     "settings": ("Settings", "https://code.claude.com/docs/en/settings.md"),
     "permissions": ("Permissions", "https://code.claude.com/docs/en/permissions.md"),
@@ -1582,6 +1583,13 @@ def build_review_input(env: Env, targets: dict):
                 f'<!-- {k["role"]} -->\n{text}\n</file>')
             if total >= REVIEW_MAX_BYTES:
                 break
+    url_lines = "\n".join(f"- {GUIDANCE[u][0]}: {GUIDANCE[u][1]}" for u in guidance_keys_for(kinds))
+    return REVIEW_INSTRUCTIONS.format(urls=url_lines), "\n\n".join(parts), meta
+
+
+def guidance_keys_for(kinds) -> List[str]:
+    """The official pages a review of these file kinds is judged against (the benchmark)."""
+    kinds = set(kinds)
     urls = ["memory", "best"]
     for g, ks in KIND_GUIDANCE.items():
         if kinds & ks:
@@ -1590,8 +1598,197 @@ def build_review_input(env: Env, targets: dict):
         urls.append("skills_bp")
     if kinds & KIND_GUIDANCE["settings"]:
         urls += ["permissions", "hooks"]
-    url_lines = "\n".join(f"- {GUIDANCE[u][0]}: {GUIDANCE[u][1]}" for u in dict.fromkeys(urls))
-    return REVIEW_INSTRUCTIONS.format(urls=url_lines), "\n\n".join(parts), meta
+    return list(dict.fromkeys(urls))
+
+
+# --------------------------------------------------------------------------------------
+# Guidance tracking: DotClaude keeps a copy of each benchmark page in ~/.dotclaude/guidance/
+# and compares on every check, so it can say when Anthropic changed a page and which of your
+# files were last edited before that. It can only see changes from its first check onward.
+# --------------------------------------------------------------------------------------
+
+GUIDANCE_STALE_S = 12 * 3600       # the app re-checks on start if the last check is older
+LAUNCH_LABEL = "com.dotclaude.guidance-check"
+
+
+def _guidance_dir(env: Env) -> Path:
+    return env.state_dir / "guidance"
+
+
+def _guidance_state(env: Env) -> dict:
+    try:
+        d = json.loads((_guidance_dir(env) / "state.json").read_text())
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def http_fetch(url: str) -> str:
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": f"DotClaude/{APP_VERSION}"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def _normalise(text: str) -> str:
+    return "\n".join(l.rstrip() for l in text.strip().splitlines()) + "\n"
+
+
+def check_guidance(env: Env, fetch=None) -> dict:
+    """Fetch every benchmark page, compare with the saved copy, record what changed."""
+    import hashlib
+    fetch = fetch or http_fetch
+    d = _guidance_dir(env)
+    d.mkdir(parents=True, exist_ok=True)
+    state = _guidance_state(env)
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    changed, failed = [], []
+    for key, (title, url) in GUIDANCE.items():
+        s = state.setdefault(key, {})
+        s.update({"title": title, "url": url, "checked": now})
+        try:
+            text = _normalise(fetch(url))
+            if len(text) < 200:
+                raise ValueError("page came back nearly empty")
+        except Exception as e:
+            s["error"] = f"{type(e).__name__}: {e}"[:200]
+            failed.append(key)
+            continue
+        s.pop("error", None)
+        h = hashlib.sha256(text.encode()).hexdigest()
+        cur = d / f"{key}.md"
+        if s.get("url_hashed") != url:          # first sight, or the page moved: new baseline, not a change
+            s.update({"hash": h, "first_seen": now, "changed": None, "url_hashed": url})
+            atomic_write(cur, text)
+            (d / f"{key}.prev.md").unlink(missing_ok=True)
+        elif s.get("hash") != h:
+            if cur.is_file():
+                os.replace(cur, d / f"{key}.prev.md")
+            atomic_write(cur, text)
+            s.update({"hash": h, "changed": now})
+            changed.append(key)
+    atomic_write(d / "state.json", json.dumps(state, indent=2) + "\n")
+    return {"checked": now, "changed": changed, "failed": failed}
+
+
+def _reviewable_files(env: Env, tree: dict) -> List[dict]:
+    return [it for it in iter_files(tree) if it["exists"] and it["kind"] not in NOT_REVIEWED
+            and not it["readonly"]]
+
+
+def guidance_status(env: Env) -> dict:
+    state = _guidance_state(env)
+    tree = discover(env)
+    used: Dict[str, set] = {k: set() for k in GUIDANCE}
+    for kind in KINDS:
+        if kind in NOT_REVIEWED or KINDS[kind].get("KINDS_PLACEHOLDER"):
+            continue
+        for g in guidance_keys_for({kind}):
+            if g not in ("memory", "best"):     # those two apply to every review; the page says so
+                used[g].add(KINDS[kind]["title"])
+    pages = []
+    for key, (title, url) in GUIDANCE.items():
+        s = state.get(key, {})
+        pages.append({"key": key, "title": title, "url": url, "checked": s.get("checked"),
+                      "first_seen": s.get("first_seen"), "changed": s.get("changed"), "error": s.get("error"),
+                      "has_diff": (_guidance_dir(env) / f"{key}.prev.md").is_file(),
+                      "used_for": sorted(used[key])})
+    behind = []
+    for it in _reviewable_files(env, tree):
+        mtime = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(Path(it["path"]).stat().st_mtime))
+        newer = [k for k in guidance_keys_for({it["kind"]}) if (state.get(k) or {}).get("changed")
+                 and state[k]["changed"] > mtime]
+        if newer:
+            behind.append({"path": it["path"], "label": tilde(env, it["path"]), "edited": mtime,
+                           "pages": [GUIDANCE[k][0] for k in newer],
+                           "latest": max(state[k]["changed"] for k in newer)})
+    behind.sort(key=lambda b: b["latest"], reverse=True)
+    checks = [s.get("checked") for s in state.values() if s.get("checked")]
+    return {"pages": pages, "behind": behind, "last_check": max(checks) if checks else None,
+            "notify": notify_status(env)}
+
+
+def guidance_diff(env: Env, key: str) -> dict:
+    if key not in GUIDANCE:
+        raise ApiError(404, "Unknown page.")
+    d = _guidance_dir(env)
+    prev, cur = d / f"{key}.prev.md", d / f"{key}.md"
+    if not prev.is_file() or not cur.is_file():
+        raise ApiError(404, "No earlier copy of this page to compare with yet.")
+    diff = "".join(difflib.unified_diff(prev.read_text().splitlines(True), cur.read_text().splitlines(True),
+                                        "before", "now", n=2))
+    return {"key": key, "title": GUIDANCE[key][0], "url": GUIDANCE[key][1], "diff": diff}
+
+
+def maybe_check_guidance(env: Env) -> None:
+    """On app start: re-check in the background if the last check is old."""
+    st = _guidance_state(env)
+    last = max((s.get("checked") or "" for s in st.values()), default="")
+    try:
+        age = time.time() - time.mktime(time.strptime(last, "%Y-%m-%dT%H:%M:%S")) if last else None
+    except ValueError:
+        age = None
+    if age is None or age > GUIDANCE_STALE_S:
+        threading.Thread(target=lambda: check_guidance(env), daemon=True).start()
+
+
+# ---- macOS notifications: a LaunchAgent runs `dotclaude.py --check-guidance --notify` daily ----
+
+def _launch_agent_path(env: Env) -> Path:
+    return env.home / "Library/LaunchAgents" / f"{LAUNCH_LABEL}.plist"
+
+
+def notify_status(env: Env) -> dict:
+    return {"on": _launch_agent_path(env).is_file(), "time": "09:00 every day",
+            "log": tilde(env, env.home / "Library/Logs/DotClaude/guidance-check.log")}
+
+
+def launch_agent_plist(env: Env, script: Path, python: str) -> str:
+    import plistlib
+    log = str(env.home / "Library/Logs/DotClaude/guidance-check.log")
+    return plistlib.dumps({
+        "Label": LAUNCH_LABEL,
+        "ProgramArguments": [python, str(script), "--check-guidance", "--notify"],
+        "StartCalendarInterval": {"Hour": 9, "Minute": 0},
+        "StandardOutPath": log, "StandardErrorPath": log,
+    }).decode()
+
+
+def set_notify(env: Env, on: bool, run=None) -> dict:
+    """Install or remove the daily check. `run` executes launchctl (swapped out by the self-test)."""
+    run = run or (lambda args: subprocess.run(args, capture_output=True, text=True))
+    p = _launch_agent_path(env)
+    domain = f"gui/{os.getuid()}"
+    if p.is_file():
+        run(["launchctl", "bootout", domain, str(p)])
+    if on:
+        (env.home / "Library/Logs/DotClaude").mkdir(parents=True, exist_ok=True)
+        atomic_write(p, launch_agent_plist(env, Path(__file__).resolve(), sys.executable))
+        r = run(["launchctl", "bootstrap", domain, str(p)])
+        if getattr(r, "returncode", 0) != 0:
+            p.unlink(missing_ok=True)
+            raise ApiError(500, "macOS refused the daily check: " + (getattr(r, "stderr", "") or "").strip()[:300])
+    else:
+        p.unlink(missing_ok=True)
+    return notify_status(env)
+
+
+def notify_mac(title: str, message: str) -> None:
+    if sys.platform == "darwin":
+        script = f'display notification {json.dumps(message)} with title {json.dumps(title)}'
+        subprocess.run(["osascript", "-e", script], capture_output=True)
+
+
+def notification_text(env: Env, result: dict) -> Optional[str]:
+    """What the daily check says, or None when nothing changed."""
+    if not result["changed"]:
+        return None
+    names = [GUIDANCE[k][0] for k in result["changed"]]
+    behind = guidance_status(env)["behind"]
+    msg = "Updated: " + ", ".join(names) + "."
+    if behind:
+        msg += f" {len(behind)} of your files predate it. Open DotClaude to review."
+    return msg
 
 
 class ReviewJobs:
@@ -1809,6 +2006,10 @@ def make_handler(env: Env, token: str, port_ref: dict):
                 self._run(lambda: compare_files(env, (q.get("a") or [""])[0], (q.get("b") or [""])[0]))
             elif u.path == "/api/tidy":
                 self._run(lambda: list_tidy(env))
+            elif u.path == "/api/guidance":
+                self._run(lambda: guidance_status(env))
+            elif u.path == "/api/guidance/diff":
+                self._run(lambda: guidance_diff(env, (q.get("key") or [""])[0]))
             elif u.path == "/api/file":
                 self._run(lambda: read_file(env, (q.get("path") or [""])[0]))
             else:
@@ -1841,6 +2042,8 @@ def make_handler(env: Env, token: str, port_ref: dict):
                 "/api/review/cancel": lambda: jobs.cancel(body.get("id", "")),
                 "/api/tidy/archive": lambda: archive_strays(env, body.get("paths")),
                 "/api/tidy/restore": lambda: restore_archived(env, body.get("id", "")),
+                "/api/guidance/check": lambda: {**check_guidance(env), **guidance_status(env)},
+                "/api/notify": lambda: set_notify(env, bool(body.get("on"))),
                 "/api/review/apply": lambda: apply_rewrite(env, body.get("path", ""), body.get("content", ""),
                                                            body.get("base_mtime")),
             }
@@ -2377,6 +2580,66 @@ print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "re
         except ApiError as e:
             check("tidy: bad archive id refused", e.status == 400)
 
+        print("Best-practice benchmark tracking (fake web)")
+        pages = {url: f"# {title}\n" + "guidance line\n" * 30 for title, url in GUIDANCE.values()}
+        fake = lambda url: pages[url]
+        g1 = check_guidance(env2, fetch=fake)
+        st1 = guidance_status(env2)
+        check("guidance: first check is a baseline, not a change", g1["changed"] == [] and
+              all(p["first_seen"] and not p["changed"] for p in st1["pages"]))
+        check("guidance: nothing changed means nothing reported", check_guidance(env2, fetch=fake)["changed"] == [])
+        check("guidance: no notification when nothing changed", notification_text(env2, {"changed": []}) is None)
+        check("guidance: every page lists what it's used for (memory and best: every review)",
+              all(p["used_for"] for p in st1["pages"] if p["key"] in ("settings", "skills"))
+              and all(not p["used_for"] for p in st1["pages"] if p["key"] in ("memory", "best")))
+        old_mtime = time.time() - 86400                     # a file edited yesterday...
+        os.utime(c2 / "settings.json", (old_mtime, old_mtime))
+        new_mtime = time.time() + 120                       # ...and one edited after the change
+        os.utime(pa / "CLAUDE.md", (new_mtime, new_mtime))
+        set_url = GUIDANCE["settings"][1]
+        pages[set_url] = pages[set_url].replace("guidance line\n", "NEW RULE about permissions\n", 1)
+        g2 = check_guidance(env2, fetch=fake)
+        st2 = guidance_status(env2)
+        check("guidance: a changed page is detected", g2["changed"] == ["settings"])
+        behind = {b["path"] for b in st2["behind"]}
+        check("guidance: file edited before the change is flagged", str(c2 / "settings.json") in behind)
+        check("guidance: file edited after the change isn't", str(pa / "CLAUDE.md") not in behind)
+        check("guidance: file the changed page doesn't cover isn't flagged", str(c2 / "CLAUDE.md") not in behind)
+        dg = guidance_diff(env2, "settings")
+        check("guidance: 'what changed' shows the new line", "+NEW RULE about permissions" in dg["diff"])
+        check("guidance: notification names the page", "Settings" in (notification_text(env2, g2) or ""))
+        try:
+            guidance_diff(env2, "memory")
+            check("guidance: no diff before a page has changed", False)
+        except ApiError as e:
+            check("guidance: no diff before a page has changed", e.status == 404)
+        def broken(url):
+            raise OSError("offline")
+        g3 = check_guidance(env2, fetch=broken)
+        st3 = guidance_status(env2)
+        check("guidance: being offline isn't reported as a change", g3["changed"] == [] and
+              len(g3["failed"]) == len(GUIDANCE) and all(p["error"] for p in st3["pages"]))
+        check("guidance: being offline keeps the last known change",
+              next(p for p in st3["pages"] if p["key"] == "settings")["changed"] == st2["pages"][
+                  [p["key"] for p in st2["pages"]].index("settings")]["changed"])
+        g4 = check_guidance(env2, fetch=lambda url: "tiny")
+        check("guidance: a near-empty page counts as a failure, not a change", g4["changed"] == [] and g4["failed"])
+        ran = []
+        ns = set_notify(env2, True, run=lambda a: (ran.append(a), type("R", (), {"returncode": 0, "stderr": ""})())[1])
+        plist = _launch_agent_path(env2).read_text()
+        check("notify: switching on installs a daily check", ns["on"] and "--check-guidance" in plist and "--notify" in plist
+              and str(Path(__file__).resolve()) in plist and any(a[1] == "bootstrap" for a in ran))
+        try:
+            set_notify(env2, True, run=lambda a: type("R", (), {"returncode": 5, "stderr": "denied"})())
+            check("notify: a refusal from macOS is reported, not hidden", False)
+        except ApiError as e:
+            check("notify: a refusal from macOS is reported, not hidden", "denied" in e.msg
+                  and not _launch_agent_path(env2).exists())
+        ns = set_notify(env2, False, run=lambda a: type("R", (), {"returncode": 0, "stderr": ""})())
+        check("notify: switching off removes it", not ns["on"] and not _launch_agent_path(env2).exists())
+        check("review: benchmark keys for settings include permissions and hooks",
+              guidance_keys_for({"user_settings"}) == ["memory", "best", "settings", "permissions", "hooks"])
+
         s, r = call("GET", "/api/load?group=global")
         check("API: /api/load works", s == 200 and "tokens" in r)
         s, r = call("GET", "/api/drift")
@@ -2423,11 +2686,23 @@ def main():
     ap.add_argument("--port", type=int, default=0, help="port (default: first free from 8765)")
     ap.add_argument("--no-browser", action="store_true", help="don't open a browser tab")
     ap.add_argument("--self-test", action="store_true", help="run built-in checks and exit")
+    ap.add_argument("--check-guidance", action="store_true",
+                    help="check Anthropic's best-practice pages for changes, print what changed, and exit")
+    ap.add_argument("--notify", action="store_true", help="with --check-guidance: show a macOS notification on changes")
     ap.add_argument("--home", help=argparse.SUPPRESS)
     args = ap.parse_args()
     if args.self_test:
         sys.exit(self_test())
     env = Env(Path(args.home) if args.home else Path.home())
+    if args.check_guidance:
+        res = check_guidance(env)
+        print(time.strftime("%Y-%m-%d %H:%M"), "checked", len(GUIDANCE), "pages; changed:",
+              ", ".join(res["changed"]) or "none", "; failed:", ", ".join(res["failed"]) or "none")
+        msg = notification_text(env, res)
+        if msg and args.notify:
+            notify_mac("Claude Code best practice changed", msg)
+        sys.exit(1 if len(res["failed"]) == len(GUIDANCE) else 0)
+    maybe_check_guidance(env)
     srv, port, token = start_server(env, args.port)
     url = f"http://127.0.0.1:{port}/"
     print(f"{APP_NAME} {APP_VERSION} running at {url}\nPress Ctrl+C to stop.")
@@ -2675,6 +2950,7 @@ function renderNav() {
   addSection("This Mac");
   renderGroup(nav, g0, q);
   nav.appendChild(rowEl({ label: "Backups (every saved version)", cls: "folder", dot: false, onclick: () => openAllBackups(), selKey: "backups" }));
+  nav.appendChild(rowEl({ label: "Best-practice benchmark", cls: "folder", dot: false, tag: GUIDE && GUIDE.behind.length ? `${GUIDE.behind.length} to review` : "", onclick: () => openGuidance(), selKey: "guidance", title: "The official pages reviews are judged against, and when they last changed" }));
   if (TIDY && (TIDY.strays.length || TIDY.archived.length)) nav.appendChild(rowEl({ label: "Tidy up old copies", cls: "folder", dot: false, tag: TIDY.strays.length ? String(TIDY.strays.length) : "", onclick: () => openTidy(), selKey: "tidy" }));
 
   const addBtn = document.createElement("button");
@@ -2788,9 +3064,12 @@ async function openFile(it, force = false) {
   }
   const fd = driftFor([it.path]);
   const driftNote = fd.length ? `<div class="note">${fd.map((p, i) => `This file looks like a copy of <b class="mono">${esc(p.a === it.path ? p.b_label : p.a_label)}</b> (${Math.round(p.ratio * 100)}% the same), but they differ. <button class="mini" data-cmp="${i}">Compare</button>`).join("<br>")}</div>` : "";
-  c.innerHTML = head + driftNote + `<div class="editor-wrap"><div class="toolbar"><span class="status" id="st">Loading…</span><span id="lines" style="color:var(--faint)"></span><span class="spacer"></span><button class="btn" id="hist-btn" title="Earlier versions of this file">History</button>${tree.notReviewed.includes(it.kind) ? "" : `<button class="rv-btn" id="rv-file">✦ Review against best practice</button>`}<button class="btn" id="revert" disabled>Revert</button><button class="btn primary" id="save" disabled>Save  ⌘S</button></div><div id="msgs"></div><textarea id="ed" spellcheck="false"></textarea></div>`;
+  const gb = GUIDE ? GUIDE.behind.find(b => b.path === it.path) : null;
+  const guideNote = gb ? `<div class="note">Anthropic updated <b>${esc(gb.pages.join(", "))}</b> on ${esc(fmtTime(gb.latest))}, after you last edited this file (${esc(fmtTime(gb.edited))}). <button class="mini" id="gb-what">What changed</button> Then use <b>✦ Review against best practice</b> below to check it against the new version.</div>` : "";
+  c.innerHTML = head + driftNote + guideNote + `<div class="editor-wrap"><div class="toolbar"><span class="status" id="st">Loading…</span><span id="lines" style="color:var(--faint)"></span><span class="spacer"></span><button class="btn" id="hist-btn" title="Earlier versions of this file">History</button>${tree.notReviewed.includes(it.kind) ? "" : `<button class="rv-btn" id="rv-file">✦ Review against best practice</button>`}<button class="btn" id="revert" disabled>Revert</button><button class="btn primary" id="save" disabled>Save  ⌘S</button></div><div id="msgs"></div><textarea id="ed" spellcheck="false"></textarea></div>`;
   wirePathButtons(c);
   wireDrift(c, fd);
+  const gw = $("#gb-what", c); if (gw) gw.onclick = () => openGuidance();
   let f;
   try { f = await api("GET", "/api/file?path=" + encodeURIComponent(it.path)); }
   catch (e) { $("#st").textContent = e.message; $("#st").style.color = "var(--err)"; return; }
@@ -2911,7 +3190,7 @@ async function openGroup(g) {
     <div id="load-box"></div><div id="drift-g"></div>
     ${g.source === "added" ? `<p><button class="btn" id="rm">Remove from list</button> <span style="color:var(--faint);font-size:12px">Only removes it from this app. No files are touched.</span></p>` : ""}
     ${g.source === "claude" || g.source === "both" ? `<p style="color:var(--faint);font-size:12px">Listed because you've opened Claude Code in this folder (from ~/.claude.json).</p>` : ""}
-    ${exist.length ? `<p><button class="rv-btn" id="rv-group">✦ Review ${g.scope === "project" ? "this project" : "this section"} against best practice</button> <span style="color:var(--faint);font-size:12px">Fetches Anthropic's current guidance and checks all these files together.</span></p>` : ""}
+    ${exist.length ? `<p><button class="rv-btn" id="rv-group">✦ Review ${g.scope === "project" ? "this project" : "this section"} against best practice</button> <span style="color:var(--faint);font-size:12px">Checks all these files together against Anthropic's official pages, read fresh each time. <a href="#" id="bench-link">See the benchmark</a></span></p>` : ""}
     <h4 style="margin:18px 0 8px">Files that exist (${exist.length})</h4><div class="list" id="ex"></div>
     ${missing.length ? `<h4 style="margin:18px 0 8px">Files you could add (${missing.length})</h4><div class="list" id="mi"></div>` : ""}`;
   if (g.path) wirePathButtons(c);
@@ -2922,6 +3201,7 @@ async function openGroup(g) {
   const dp = driftFor(exist.map(i => i.path));
   if (dp.length) { const d = $("#drift-g", c); d.innerHTML = `<h4 style="margin:18px 0 8px">Files here that have drifted apart (${dp.length})</h4>` + driftListHtml(dp); wireDrift(d, dp); }
   const rvg = $("#rv-group", c); if (rvg) rvg.onclick = () => startReview({ group: g.id });
+  const bl = $("#bench-link", c); if (bl) bl.onclick = e => { e.preventDefault(); openGuidance(); };
   const rm = $("#rm", c);
   if (rm) rm.onclick = async () => { await api("POST", "/api/folders/remove", { path: g.path }); toast("Removed from list"); await load(); welcome(); };
 }
@@ -3031,6 +3311,60 @@ async function openTidy() {
     try { await api("POST", "/api/tidy/restore", { id: a.id }); toast("Put back " + a.label); await load(); openTidy(); }
     catch (e) { toast(e.message, 4500); }
   });
+}
+
+/* ---------------- Best-practice benchmark ---------------- */
+async function openGuidance(showKey) {
+  if (!(await guardDirty())) return;
+  cur = null; markSel("guidance");
+  const c = $("#content");
+  c.innerHTML = `<div class="crumbs">This Mac</div><h2>Best-practice benchmark</h2>
+    <div class="note"><b>What your files are judged against.</b> When you click <b>✦ Review against best practice</b>, DotClaude asks Claude Code to read the official Anthropic pages below, fresh at that moment, and to judge your files only against them. Every finding has to cite one of these pages; advice that no page supports is dropped. A review only uses the pages that apply to the files being reviewed (the "Used for" column).</div>
+    <div id="gd">Loading…</div>`;
+  let g;
+  try { g = await api("GET", "/api/guidance"); GUIDE = g; } catch (e) { $("#gd").textContent = e.message; return; }
+  renderGuidance(g, showKey);
+}
+
+function renderGuidance(g, showKey) {
+  const box = $("#gd"); if (!box) return;
+  const n = g.notify;
+  const pageRows = g.pages.map(p => `<div class="tidy-row"><span class="lab"><a href="${esc(p.url)}" target="_blank" rel="noopener"><b>${esc(p.title)}</b> ↗</a><br>
+      <span class="rv-meta">Used for: ${esc(p.used_for.join(", ") || "every review")}</span><br>
+      <span class="rv-meta">${p.error ? `<span style="color:var(--err)">Last check failed: ${esc(p.error)}</span>` : p.changed ? `<b style="color:var(--warn)">Changed ${esc(fmtTime(p.changed))}</b>` : p.first_seen ? `No change since DotClaude started tracking it (${esc(fmtTime(p.first_seen))})` : "Not checked yet"}</span></span>
+      ${p.has_diff ? `<button class="btn" data-diff="${esc(p.key)}">What changed</button>` : ""}</div>`).join("");
+  box.innerHTML = `
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px">
+      <button class="btn" id="gcheck">Check for updates now</button>
+      <span class="rv-meta">${g.last_check ? "Last checked " + esc(fmtTime(g.last_check)) : "Never checked"}. DotClaude can only see changes from its first check onward.</span>
+    </div>
+    <div class="list" style="margin-bottom:14px"><label class="tidy-row" style="cursor:pointer"><input type="checkbox" id="gnotify" ${n.on ? "checked" : ""}><span class="lab"><b>Notify me when these pages change</b><br><span class="rv-meta">A Mac notification after a daily check at ${esc(n.time)}, even when DotClaude isn't open. Log: <code>${esc(n.log)}</code></span></span></label></div>
+    ${g.behind.length ? `<h4 style="margin:18px 0 8px">Files last edited before the guidance changed (${g.behind.length})</h4><div class="list">${g.behind.map((b, i) => `<div class="tidy-row"><span class="lab"><span class="mono">${esc(b.label)}</span><br><span class="rv-meta">Edited ${esc(fmtTime(b.edited))} · ${esc(b.pages.join(", "))} changed ${esc(fmtTime(b.latest))}</span></span><button class="btn" data-open="${i}">Open</button></div>`).join("")}</div>` : ""}
+    <h4 style="margin:18px 0 8px">The official pages (${g.pages.length})</h4><div class="list">${pageRows}</div>
+    <div id="gdiff"></div>`;
+  $("#gcheck").onclick = async () => {
+    $("#gcheck").disabled = true; $("#gcheck").textContent = "Checking…";
+    try { const r = await api("POST", "/api/guidance/check"); GUIDE = r; renderNav(); markSel("guidance"); renderGuidance(r);
+      toast(r.changed.length ? `${r.changed.length} page${r.changed.length === 1 ? "" : "s"} changed` : r.failed.length ? `${r.failed.length} page(s) couldn't be loaded` : "No changes", 3500); }
+    catch (e) { toast(e.message, 4000); $("#gcheck").disabled = false; $("#gcheck").textContent = "Check for updates now"; }
+  };
+  $("#gnotify").onchange = async e => {
+    try { const r = await api("POST", "/api/notify", { on: e.target.checked }); toast(r.on ? "Notifications on: daily check at " + r.time : "Notifications off"); }
+    catch (err) { e.target.checked = !e.target.checked; toast(err.message, 4500); }
+  };
+  box.querySelectorAll("[data-open]").forEach(b => b.onclick = () => { const it = findItem(g.behind[+b.dataset.open].path); if (it) openFile(it); });
+  box.querySelectorAll("[data-diff]").forEach(b => b.onclick = () => showGuidanceDiff(b.dataset.diff));
+  if (showKey) showGuidanceDiff(showKey);
+}
+
+async function showGuidanceDiff(key) {
+  const d = $("#gdiff"); if (!d) return;
+  d.innerHTML = "Loading…";
+  try {
+    const r = await api("GET", "/api/guidance/diff?key=" + encodeURIComponent(key));
+    d.innerHTML = `<h4 style="margin:18px 0 8px">What changed: ${esc(r.title)}</h4><p class="rv-meta">Lines starting with - were removed, + were added, compared with the copy from the previous check.</p><pre class="diff">${diffHtml(r.diff)}</pre>`;
+    d.scrollIntoView({ behavior: "smooth" });
+  } catch (e) { d.innerHTML = `<p style="color:var(--err)">${esc(e.message)}</p>`; }
 }
 
 /* ---------------- Backups ---------------- */
@@ -3221,10 +3555,11 @@ async function tweakRewrite(i) {
   $("#msgs").insertAdjacentHTML("afterbegin", `<div class="msg warn">The suggested rewrite is loaded but not saved yet. Edit it if you want, then Save (the current version gets backed up first), or Revert to throw it away.</div>`);
 }
 
-let DRIFT = null, TIDY = null;  // filled in the background after each scan
+let DRIFT = null, TIDY = null, GUIDE = null;  // filled in the background after each scan
 async function load() {
   tree = await api("GET", "/api/tree"); renderNav();
   DRIFT = null; TIDY = null;
+  api("GET", "/api/guidance").then(g => { GUIDE = g; renderNav(); }).catch(() => {});
   api("GET", "/api/drift").then(d => { DRIFT = d; onExtras(); }).catch(() => {});
   api("GET", "/api/tidy").then(t => { TIDY = t; renderNav(); }).catch(() => {});
 }
