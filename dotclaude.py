@@ -29,7 +29,7 @@ from typing import Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
 APP_NAME = "DotClaude"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 DOCS = "https://code.claude.com/docs/en/"
 MAX_READ_BYTES = 10 * 1024 * 1024
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -119,6 +119,31 @@ KINDS: Dict[str, dict] = {
         label="agent-memory/", title="Subagent memory (personal)",
         role="Notes that subagents set to `memory: user` keep for themselves across all projects.",
         loads="When that subagent runs", share="Personal", docs="sub-agents.md"),
+    "user_settings_local": dict(
+        label="settings.local.json", title="Home-folder settings (just you)",
+        role="Claude Code treats your home folder like any other project, so this is the local settings file for "
+             "sessions you start in ~ itself. It is not a second copy of your personal settings: it does nothing "
+             "in your other projects.",
+        loads="Only for sessions started in your home folder (~)", share="Personal", docs="settings.md"),
+    "user_plugins": dict(
+        label="plugins/installed_plugins.json", title="Installed plugins", readonly=True,
+        readonly_reason="Claude Code manages this list. Install, update or remove plugins with /plugin. Turning a "
+                        "plugin on or off is stored as `enabledPlugins` in settings.json.",
+        role="The plugins installed on this Mac and where each came from. An enabled plugin can add skills, "
+             "subagents, hooks and MCP servers to every session, so it is worth knowing what is here.",
+        loads="Enabled plugins load at the start of every session", share="Personal", docs="plugins.md"),
+    "user_scripts": dict(
+        label="Hook & status line scripts", title="Scripts your personal settings run",
+        role="Scripts in ~/.claude/hooks/ and any script your settings.json runs as a hook or status line. "
+             "Hooks run automatically on events such as \"before a tool runs\", so they can block or change "
+             "what Claude does. Editing one changes that behaviour in every project.",
+        loads="When the hook's event fires, or whenever the status line redraws", share="Personal",
+        docs="hooks-guide.md"),
+    "proj_scripts": dict(
+        label=".claude hook scripts", title="Scripts this project's settings run",
+        role="Scripts in .claude/hooks/ and any script this project's settings files run as a hook or status "
+             "line. They only run in this project.",
+        loads="When the hook's event fires", share="Shared if committed", docs="hooks-guide.md"),
     "claude_json": dict(
         label="~/.claude.json", title="Claude Code app state", readonly=True,
         readonly_reason="Claude Code rewrites this file constantly, so hand edits can be lost or corrupt it. "
@@ -268,7 +293,9 @@ for _p, _u in [("proj_rules", "user_rules"), ("proj_skills", "user_skills"), ("p
 
 # File specs: (kind, path relative to scope root, show when missing)
 GLOBAL_FILES = [("user_claude_md", "CLAUDE.md", True), ("user_settings", "settings.json", True),
-                ("keybindings", "keybindings.json", True)]
+                ("user_settings_local", "settings.local.json", False),
+                ("keybindings", "keybindings.json", True),
+                ("user_plugins", "plugins/installed_plugins.json", False)]
 # Folder specs: (kind, dir, layout, pattern, show when empty)
 #   layout "flat": <dir>/<name><ext>   "nested": <dir>/<name>/SKILL.md   "deep": any depth
 GLOBAL_FOLDERS = [
@@ -550,6 +577,9 @@ def discover(env: Env) -> dict:
         it = folder_item(kind, env.claude_dir / rel, layout, pat, show, "global")
         if it:
             g["items"].append(it)
+    it = scripts_item("user_scripts", env.claude_dir, env.home, None, "global")
+    if it:
+        g["items"].append(it)
     it = file_item("claude_json", env.claude_json, True, "global", label="~/.claude.json")
     g["items"].append(it)
     groups.append(g)
@@ -586,6 +616,9 @@ def discover(env: Env) -> dict:
                 it = folder_item(kind, p / rel, layout, pat, show, gid)
                 if it:
                     pg["items"].append(it)
+            it = scripts_item("proj_scripts", p / ".claude", env.home, p, gid)
+            if it:
+                pg["items"].append(it)
         # Auto memory
         mem_dir = automem_dir(env, p, pr.get("aliases", []))
         matched_mem.add(str(mem_dir))
@@ -697,6 +730,423 @@ def iter_files(tree: dict):
             else:
                 for c in it["children"]:
                     yield c
+
+
+# --------------------------------------------------------------------------------------
+# Hook and status line scripts: files in .claude/hooks/ plus scripts a settings file runs
+# --------------------------------------------------------------------------------------
+
+SCRIPT_EXTS = {".sh", ".bash", ".zsh", ".fish", ".py", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl"}
+
+
+def settings_commands(path: Path) -> List[str]:
+    """Every `command` string under `hooks` and `statusLine` in a settings file."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    out: List[str] = []
+
+    def walk(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if k == "command" and isinstance(v, str):
+                    out.append(v)
+                else:
+                    walk(v)
+        elif isinstance(o, list):
+            for x in o:
+                walk(x)
+    if isinstance(data, dict):
+        walk(data.get("hooks"))
+        walk(data.get("statusLine"))
+    return out
+
+
+def command_scripts(commands: List[str], home: Path, project: Optional[Path]) -> List[Path]:
+    """Script files named in hook/status line commands. Only text scripts inside the home folder count,
+    so a command like `/usr/bin/env` or a script elsewhere on the disk never becomes editable here."""
+    import shlex
+    found: List[Path] = []
+    for cmd in commands:
+        try:
+            toks = shlex.split(cmd)
+        except ValueError:
+            toks = cmd.split()
+        for t in toks:
+            t = t.replace("${HOME}", str(home)).replace("$HOME", str(home))
+            if project is not None:
+                t = t.replace("${CLAUDE_PROJECT_DIR}", str(project)).replace("$CLAUDE_PROJECT_DIR", str(project))
+            if t.startswith("~/"):
+                t = str(home) + t[1:]
+            if "/" not in t:
+                continue
+            p = Path(t)
+            if not p.is_absolute():
+                if project is None:
+                    continue
+                p = project / p
+            p = Path(os.path.normpath(str(p)))
+            try:
+                real = p.resolve()
+            except OSError:
+                continue
+            if (p.is_file() and p.suffix in SCRIPT_EXTS and home.resolve() in real.parents
+                    and p not in found):
+                found.append(p)
+    return found
+
+
+def scripts_item(kind: str, claude_dir: Path, home: Path, project: Optional[Path], gid: str) -> Optional[dict]:
+    hooks_dir = claude_dir / "hooks"
+    files = [f for f in list_folder(hooks_dir, "deep", "") if f.suffix in SCRIPT_EXTS]
+    cmds: List[str] = []
+    for name in ("settings.json", "settings.local.json"):
+        cmds += settings_commands(claude_dir / name)
+    for f in command_scripts(cmds, home, project):
+        if f not in files:
+            files.append(f)
+    if not files:
+        return None
+    k = KINDS[kind]
+    children = []
+    for f in files:
+        try:
+            label = str(f.relative_to(claude_dir))
+        except ValueError:
+            label = "~" + str(f)[len(str(home)):] if str(f).startswith(str(home) + os.sep) else str(f)
+        children.append(file_item(kind, f, False, gid, label=label))
+    return {"type": "folder", "kind": kind, "group": gid, "label": k["label"], "path": str(hooks_dir),
+            "children": children, "canCreate": False}
+
+
+# --------------------------------------------------------------------------------------
+# What loads at the start of a session (rules from code.claude.com/docs/en/memory.md,
+# checked 2026-11-01): CLAUDE.md files in the folder and every folder above it, @imports up
+# to 4 hops (not inside code spans or fenced blocks), AGENTS.md only when none of CLAUDE.md,
+# .claude/CLAUDE.md or CLAUDE.local.md exists in the folder or above it (~/.claude/CLAUDE.md
+# doesn't count for that check), rules without `paths:`, the first 200 lines / 25 KB of
+# MEMORY.md, and only the frontmatter of skills and subagents. HTML block comments are
+# stripped before loading. Token counts are an estimate: characters / 4.
+# --------------------------------------------------------------------------------------
+
+IMPORT_MAX_HOPS = 4
+MEMORY_MAX_LINES = 200
+MEMORY_MAX_BYTES = 25 * 1024
+CHARS_PER_TOKEN = 4
+IMPORT_RE = re.compile(r"(?:(?<=\s)|^)@((?:\\ |[^\s\"'`])+)")
+HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+INSTRUCTION_NAMES = ("CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md")
+
+
+def _lines_outside_code(text: str) -> List[str]:
+    out, fence = [], None
+    for line in text.splitlines():
+        s = line.lstrip()
+        if fence:
+            if s.startswith(fence):
+                fence = None
+            continue
+        if s.startswith("```") or s.startswith("~~~"):
+            fence = s[:3]
+            continue
+        out.append(re.sub(r"`[^`]*`", "", line))
+    return out
+
+
+def find_imports(text: str, base: Path, home: Path) -> List[str]:
+    """Raw import targets (as written) in a memory file."""
+    found = []
+    for line in _lines_outside_code(text):
+        for m in IMPORT_RE.finditer(line):
+            raw = m.group(1).replace("\\ ", " ").rstrip(".,;:)]}")
+            if raw:
+                found.append(raw)
+    return found
+
+
+def resolve_import(raw: str, base: Path, home: Path) -> Path:
+    if raw.startswith("~/"):
+        return home / raw[2:]
+    p = Path(raw)
+    return p if p.is_absolute() else base / p
+
+
+def frontmatter(text: str) -> Optional[str]:
+    if not text.startswith("---"):
+        return None
+    end = text.find("\n---", 3)
+    return text[3:end] if end != -1 else None
+
+
+def _read_text(p: Path) -> Optional[str]:
+    try:
+        if p.stat().st_size > MAX_READ_BYTES:
+            return None
+        return p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def startup_load(env: Env, group_id: str) -> dict:
+    tree = discover(env)
+    g = next((x for x in tree["groups"] + tree["projects"] if x["id"] == group_id), None)
+    if not g or g.get("missing") or g["scope"] not in ("global", "project"):
+        raise ApiError(404, "Unknown section.")
+    entries: List[dict] = []
+    warnings: List[str] = []
+    seen = set()
+    user_md = env.claude_dir / "CLAUDE.md"
+
+    def add(p: Path, how: str, via: Optional[Path] = None, hops: int = 0):
+        try:
+            key = p.resolve()
+        except OSError:
+            return
+        if key in seen:
+            return
+        seen.add(key)
+        text = _read_text(p)
+        if text is None:
+            return
+        loaded = HTML_COMMENT_RE.sub("", text)
+        entries.append({"path": str(p), "label": tilde(env, p), "how": how, "chars": len(loaded),
+                        "via": tilde(env, via) if via else None})
+        if hops >= IMPORT_MAX_HOPS:
+            return
+        for raw in find_imports(loaded, p.parent, env.home):
+            target = resolve_import(raw, p.parent, env.home)
+            if target.is_file():
+                add(target, "Imported with @", via=p, hops=hops + 1)
+            elif "/" in raw or raw.endswith(".md"):
+                warnings.append(f"{tilde(env, p)} imports @{raw}, but that file doesn't exist.")
+
+    def add_rules(rules_dir: Path, how: str):
+        for f in list_folder(rules_dir, "deep", ".md"):
+            fm = frontmatter(_read_text(f) or "")
+            if fm is None or not re.search(r"^paths\s*:", fm, re.M):
+                add(f, how)
+
+    def add_descriptions(claude_dir: Path, who: str):
+        total, n = 0, 0
+        for f in list_folder(claude_dir / "skills", "nested", "SKILL.md") + list_folder(claude_dir / "agents", "flat", ".md"):
+            fm = frontmatter(_read_text(f) or "")
+            if fm is None or re.search(r"^disable-model-invocation\s*:\s*true", fm, re.M):
+                continue
+            total += len(fm)
+            n += 1
+        if n:
+            entries.append({"path": str(claude_dir), "label": f"{who} skills and subagents ({n})",
+                            "how": "Names and descriptions only, until one is used", "chars": total, "via": None})
+
+    # Loaded in every project
+    if user_md.is_file():
+        add(user_md, "Your personal CLAUDE.md, in every project")
+    add_rules(env.claude_dir / "rules", "Personal rule without paths:, in every project")
+    add_descriptions(env.claude_dir, "Personal")
+
+    if g["scope"] == "project":
+        p = Path(g["path"])
+        chain = [p] + list(p.parents)
+        has_md = False
+        for d in chain:
+            for name in INSTRUCTION_NAMES:
+                f = d / name
+                if f.is_file() and not (user_md.is_file() and f.resolve() == user_md.resolve()):
+                    has_md = True
+                    add(f, "This project's instructions" if d == p else "From a parent folder")
+        if not has_md:
+            for d in chain:
+                for name in ("AGENTS.md", ".claude/AGENTS.md"):
+                    f = d / name
+                    if f.is_file():
+                        add(f, "AGENTS.md: loads because there's no CLAUDE.md here or in any folder above")
+                        warnings.append(f"No CLAUDE.md in this folder or above, so Claude Code loads "
+                                        f"{tilde(env, f)} instead.")
+        if p != env.home:
+            add_rules(p / ".claude/rules", "Project rule without paths:")
+            add_descriptions(p / ".claude", "Project")
+        mem = Path(g["memDir"]) / "MEMORY.md"
+        if mem.is_file():
+            text = _read_text(mem) or ""
+            lines = text.splitlines(True)
+            loaded = "".join(lines[:MEMORY_MAX_LINES]).encode("utf-8")[:MEMORY_MAX_BYTES].decode("utf-8", "ignore")
+            entries.append({"path": str(mem), "label": tilde(env, mem), "how": "Auto memory (first 200 lines, max 25 KB)",
+                            "chars": len(loaded), "via": None})
+            if len(loaded) < len(text):
+                warnings.append(f"{tilde(env, mem)} is longer than what loads: Claude only sees the first "
+                                f"{MEMORY_MAX_LINES} lines (max 25 KB).")
+
+    for e in entries:
+        e["tokens"] = round(e["chars"] / CHARS_PER_TOKEN)
+    total = sum(e["chars"] for e in entries)
+    return {"group": group_id, "entries": entries, "chars": total, "tokens": round(total / CHARS_PER_TOKEN),
+            "warnings": list(dict.fromkeys(warnings)),
+            "estimate": "Characters divided by 4, a rough rule of thumb for English text.",
+            "not_counted": "Claude Code's own instructions, MCP tool lists, and skills that plugins add."}
+
+
+# --------------------------------------------------------------------------------------
+# Drift: instruction files that are mostly copies of each other but no longer match
+# (for example CLAUDE.md and AGENTS.md kept side by side). On this Mac, copy pairs scored
+# 0.76 to 1.00 and every unrelated pair under 0.30 (measured 2026-11-01), hence 0.6.
+# --------------------------------------------------------------------------------------
+
+DRIFT_KINDS = {"user_claude_md", "user_rules", "proj_claude_md", "proj_dot_claude_md", "proj_local_md",
+               "proj_agents_md", "proj_rules", "parent_md", "sub_md"}
+DRIFT_MIN_RATIO = 0.6
+DRIFT_MIN_LINES = 5
+
+
+def _mirror_candidates(a: Path, b: Path) -> bool:
+    """Copies meant to say the same thing sit side by side: in one folder (CLAUDE.md and AGENTS.md), or in
+    a folder and its .claude/ subfolder (CLAUDE.md and .claude/CLAUDE.md; ~/AGENTS.md and
+    ~/.claude/CLAUDE.md). Similar files in different folders or projects are usually one template filled
+    in differently on purpose, so they don't count."""
+    return a.parent == b.parent or a.parent == b.parent / ".claude" or b.parent == a.parent / ".claude"
+
+
+def find_drift(env: Env) -> dict:
+    files: Dict[str, dict] = {}
+    for it in iter_files(discover(env)):
+        if it["exists"] and it["kind"] in DRIFT_KINDS:
+            files.setdefault(str(Path(it["path"]).resolve()), it)  # same file under two names counts once
+    texts = {k: (_read_text(Path(it["path"])) or "").splitlines() for k, it in files.items()}
+    pairs = []
+    keys = sorted(files)
+    for i, a in enumerate(keys):
+        for b in keys[i + 1:]:
+            la, lb = texts[a], texts[b]
+            if len(la) < DRIFT_MIN_LINES or len(lb) < DRIFT_MIN_LINES or la == lb:
+                continue
+            if not _mirror_candidates(Path(files[a]["path"]), Path(files[b]["path"])):
+                continue
+            sm = difflib.SequenceMatcher(None, la, lb, autojunk=False)
+            if sm.real_quick_ratio() < DRIFT_MIN_RATIO or sm.quick_ratio() < DRIFT_MIN_RATIO:
+                continue
+            r = sm.ratio()
+            if r < DRIFT_MIN_RATIO:
+                continue
+            changed = sum(max(i2 - i1, j2 - j1) for op, i1, i2, j1, j2 in sm.get_opcodes() if op != "equal")
+            pa, pb = files[a]["path"], files[b]["path"]
+            pairs.append({"a": pa, "b": pb, "a_label": tilde(env, pa), "b_label": tilde(env, pb),
+                          "ratio": round(r, 2), "changed_lines": changed})
+    pairs.sort(key=lambda x: (-x["ratio"], x["a_label"]))
+    return {"pairs": pairs, "checked": len(files)}
+
+
+def compare_files(env: Env, a: str, b: str) -> dict:
+    managed = {it["path"] for it in iter_files(discover(env)) if it["exists"]}
+    if a not in managed or b not in managed:
+        raise ApiError(403, "Both files must be Claude files this app manages.")
+    ta, tb = _read_text(Path(a)) or "", _read_text(Path(b)) or ""
+    diff = "".join(difflib.unified_diff(ta.splitlines(True), tb.splitlines(True), tilde(env, a), tilde(env, b), n=2))
+    return {"a": a, "b": b, "a_label": tilde(env, a), "b_label": tilde(env, b), "diff": diff, "same": ta == tb}
+
+
+# --------------------------------------------------------------------------------------
+# Tidy up: hand-made copies sitting next to a Claude file, such as settings.json.bak-2026…
+# or CLAUDE.md.v1-backup. They are moved (never deleted) to ~/.dotclaude/archive/ and can be
+# put back. A copy that an instruction file mentions by name is flagged, because moving it
+# would break that reference.
+# --------------------------------------------------------------------------------------
+
+STRAY_BASE_KINDS = {"user_claude_md", "user_settings", "user_settings_local", "keybindings", "proj_claude_md",
+                    "proj_dot_claude_md", "proj_local_md", "proj_agents_md", "proj_settings",
+                    "proj_settings_local", "proj_mcp", "desktop_config"}
+STRAY_SEPARATORS = ".-_~ "
+ARCHIVE_ID_RE = re.compile(r"^\d{8}-\d{6}(-\d+)?/[^/\\]+$")
+
+
+def find_strays(env: Env) -> List[dict]:
+    tree = discover(env)
+    managed = {it["path"] for it in iter_files(tree)}
+    bases: Dict[Path, set] = {}
+    for it in iter_files(tree):
+        if it["kind"] in STRAY_BASE_KINDS:
+            p = Path(it["path"])
+            bases.setdefault(p.parent, set()).add(p.name)
+    out: Dict[str, dict] = {}
+    for d, names in bases.items():
+        if not d.is_dir():
+            continue
+        for f in d.iterdir():
+            if not f.is_file() or f.is_symlink() or str(f) in managed:
+                continue
+            for n in names:
+                if len(f.name) > len(n) and f.name.startswith(n) and f.name[len(n)] in STRAY_SEPARATORS:
+                    st = f.stat()
+                    out[str(f)] = {"path": str(f), "label": tilde(env, f), "of": tilde(env, d / n),
+                                   "size": st.st_size, "mtime": time.strftime("%Y-%m-%dT%H:%M:%S",
+                                                                               time.localtime(st.st_mtime))}
+                    break
+    texts = [(it["path"], _read_text(Path(it["path"])) or "") for it in iter_files(tree)
+             if it["exists"] and it["kind"] in DRIFT_KINDS]
+    for s in out.values():
+        name = Path(s["path"]).name
+        s["referenced_in"] = [tilde(env, p) for p, t in texts if name in t]
+    return sorted(out.values(), key=lambda s: s["label"].lower())
+
+
+def _archive_index_path(env: Env) -> Path:
+    return env.state_dir / "archive" / "index.json"
+
+
+def _archive_index(env: Env) -> List[dict]:
+    try:
+        data = json.loads(_archive_index_path(env).read_text())
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def list_tidy(env: Env) -> dict:
+    archived = [{**e, "label": tilde(env, e["original"])} for e in reversed(_archive_index(env))]
+    return {"strays": find_strays(env), "archived": archived, "dir": tilde(env, env.state_dir / "archive")}
+
+
+def archive_strays(env: Env, paths: List[str]) -> dict:
+    if not isinstance(paths, list) or not paths:
+        raise ApiError(400, "Pick at least one file.")
+    allowed = {s["path"] for s in find_strays(env)}
+    bad = [p for p in paths if p not in allowed]
+    if bad:
+        raise ApiError(403, "Only the old copies DotClaude lists can be archived.", {"refused": bad})
+    root = env.state_dir / "archive"
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    d = root / stamp
+    n = 1
+    while d.exists():
+        d = root / f"{stamp}-{n}"
+        n += 1
+    d.mkdir(parents=True)
+    idx = _archive_index(env)
+    for p in dict.fromkeys(paths):
+        dest = d / flat_name(p)
+        shutil.move(p, str(dest))
+        idx.append({"id": f"{d.name}/{dest.name}", "original": p, "time": time.strftime("%Y-%m-%dT%H:%M:%S")})
+        atomic_write(_archive_index_path(env), json.dumps(idx, indent=2) + "\n")  # after each move, so none is lost
+    return {"ok": True, "moved": len(dict.fromkeys(paths)), "dir": tilde(env, d)}
+
+
+def restore_archived(env: Env, aid: str) -> dict:
+    if not aid or not ARCHIVE_ID_RE.match(aid) or ".." in aid:
+        raise ApiError(400, "Bad archive id.")
+    idx = _archive_index(env)
+    e = next((x for x in idx if x.get("id") == aid), None)
+    root = (env.state_dir / "archive").resolve()
+    src = (env.state_dir / "archive" / aid).resolve()
+    if not e or root not in src.parents or not src.is_file():
+        raise ApiError(404, "That archived file doesn't exist.")
+    orig = Path(e["original"])
+    if orig.exists():
+        raise ApiError(409, "A file with that name is already back in place, so nothing was moved.")
+    if not orig.parent.is_dir():
+        raise ApiError(409, "The folder it came from doesn't exist any more.")
+    shutil.move(str(src), str(orig))
+    idx = [x for x in idx if x.get("id") != aid]
+    atomic_write(_archive_index_path(env), json.dumps(idx, indent=2) + "\n")
+    return {"ok": True, "path": str(orig)}
 
 
 # --------------------------------------------------------------------------------------
@@ -971,10 +1421,11 @@ GUIDANCE = {
 KIND_GUIDANCE = {
     "skills": {"user_skills", "proj_skills", "user_commands", "proj_commands"},
     "agents": {"user_agents", "proj_agents"},
-    "settings": {"user_settings", "proj_settings", "proj_settings_local", "managed_settings"},
+    "settings": {"user_settings", "user_settings_local", "proj_settings", "proj_settings_local", "managed_settings"},
     "mcp": {"proj_mcp", "desktop_config", "managed_mcp"},
 }
-NOT_REVIEWED = {"claude_json", "desktop_app_config", "user_themes", "user_workflows", "proj_workflows"}
+NOT_REVIEWED = {"claude_json", "desktop_app_config", "user_themes", "user_workflows", "proj_workflows",
+                "user_plugins", "user_scripts", "proj_scripts"}
 REVIEW_MAX_FILES = 60
 REVIEW_MAX_BYTES = 300_000
 REVIEW_TIMEOUT_S = 900
@@ -1350,6 +1801,14 @@ def make_handler(env: Env, token: str, port_ref: dict):
                 self._run(lambda: jobs.get((q.get("id") or [""])[0]))
             elif u.path == "/api/claude-cli":
                 self._run(lambda: {"path": find_claude_cli(env.home)})
+            elif u.path == "/api/load":
+                self._run(lambda: startup_load(env, (q.get("group") or [""])[0]))
+            elif u.path == "/api/drift":
+                self._run(lambda: find_drift(env))
+            elif u.path == "/api/compare":
+                self._run(lambda: compare_files(env, (q.get("a") or [""])[0], (q.get("b") or [""])[0]))
+            elif u.path == "/api/tidy":
+                self._run(lambda: list_tidy(env))
             elif u.path == "/api/file":
                 self._run(lambda: read_file(env, (q.get("path") or [""])[0]))
             else:
@@ -1380,6 +1839,8 @@ def make_handler(env: Env, token: str, port_ref: dict):
                 "/api/backups/restore": lambda: restore_backup(env, body.get("id", ""), body.get("mtime")),
                 "/api/review/start": lambda: jobs.start(body.get("path"), body.get("group"), body.get("model") or None),
                 "/api/review/cancel": lambda: jobs.cancel(body.get("id", "")),
+                "/api/tidy/archive": lambda: archive_strays(env, body.get("paths")),
+                "/api/tidy/restore": lambda: restore_archived(env, body.get("id", "")),
                 "/api/review/apply": lambda: apply_rewrite(env, body.get("path", ""), body.get("content", ""),
                                                            body.get("base_mtime")),
             }
@@ -1757,6 +2218,175 @@ print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "re
         s, rr = call("POST", "/api/backups/restore", {"id": "20260101-000001/" + cj_bk.name})
         check("restore over a read-only file refused", s == 403)
 
+        print("What loads at startup, drift, scripts, tidy (separate fake home)")
+        h2 = td / "home2"
+        c2 = h2 / ".claude"
+        sh = h2 / "shared"
+        for d in (c2 / "rules", c2 / "skills/a", c2 / "skills/b", c2 / "hooks", c2 / "plugins", sh, h2 / "bin"):
+            d.mkdir(parents=True)
+        comment = "<!-- maintainer note " + "x" * 400 + " -->\n"
+        (c2 / "CLAUDE.md").write_text("# me\n@~/shared/team.md\n`@~/shared/ignored.md`\n```\n@~/shared/fenced.md\n```\n"
+                                      "@~/shared/missing.md\nmail a@b.com\nold copy: settings.json.bak-1\n" + comment)
+        (sh / "team.md").write_text("team\n@deep1.md\n")
+        for i in range(1, 5):
+            (sh / f"deep{i}.md").write_text(f"deep{i}\n@deep{i + 1}.md\n@team.md\n")  # also a cycle back to team.md
+        (sh / "ignored.md").write_text("never\n")
+        (sh / "fenced.md").write_text("never\n")
+        (c2 / "rules/always.md").write_text("always\n")
+        (c2 / "rules/py.md").write_text('---\npaths:\n  - "**/*.py"\n---\npy only\n')
+        (c2 / "skills/a/SKILL.md").write_text("---\nname: a\ndescription: does a\n---\n" + "body\n" * 300)
+        (c2 / "skills/b/SKILL.md").write_text("---\nname: b\ndescription: manual\ndisable-model-invocation: true\n---\n")
+        outside = td / "outside.sh"
+        outside.write_text("echo hi\n")
+        (c2 / "settings.json").write_text(json.dumps({
+            "hooks": {"PreToolUse": [{"hooks": [
+                {"type": "command", "command": 'python3 "$HOME/.claude/hooks/guard.py"'},
+                {"type": "command", "command": f"bash {outside}"},
+                {"type": "command", "command": "/usr/bin/env true"}]}]},
+            "statusLine": {"type": "command", "command": "bash ~/bin/status.sh"}}))
+        (c2 / "hooks/guard.py").write_text("print('ok')\n")
+        (h2 / "bin/status.sh").write_text("echo status\n")
+        (c2 / "plugins/installed_plugins.json").write_text('{"version": 2, "plugins": {}}\n')
+        (c2 / "settings.local.json").write_text('{"permissions": {"allow": []}}\n')
+        (c2 / "settings.json.bak-1").write_text("{}\n")
+        (c2 / "CLAUDE.md.old-copy").write_text("old\n")
+        (c2 / "settings.json5").write_text("not a copy\n")
+        base_md = "".join(f"line {i}\n" for i in range(8))
+        pa, pb, pd = h2 / "Code/a", h2 / "Code/b", h2 / "Code/d"
+        for d in (pa / "sys1", pa / "sys2", pb, pd):
+            d.mkdir(parents=True)
+        (pa / "CLAUDE.md").write_text(base_md)
+        (pa / "AGENTS.md").write_text(base_md.replace("line 3", "line 3 changed"))
+        (pa / "CLAUDE.md~").write_text("editor backup\n")
+        (pa / "sys1/CLAUDE.md").write_text(base_md + "icp\n")
+        (pa / "sys2/CLAUDE.md").write_text(base_md + "oisy\n")
+        (pb / "AGENTS.md").write_text("".join(f"other {i}\n" for i in range(8)))
+        (pd / "CLAUDE.md").write_text(base_md)
+        (pd / "AGENTS.md").write_text(base_md)
+        mem2 = c2 / "projects" / encode_project_key(pa) / "memory"
+        mem2.mkdir(parents=True)
+        (mem2 / "MEMORY.md").write_text("".join(f"note {i}\n" for i in range(250)))
+        (h2 / ".claude.json").write_text(json.dumps({"projects": {str(pa): {}, str(pb): {}, str(pd): {}}}))
+        env2 = Env(h2, managed_dir=td / "managed2", desktop_dir=td / "desktop2", state_dir=td / "state2")
+
+        L = startup_load(env2, "global")
+        names = {Path(e["path"]).name for e in L["entries"]}
+        check("load: global CLAUDE.md and its @import counted", {"CLAUDE.md", "team.md"} <= names)
+        check("load: imports followed exactly 4 hops", {"deep1.md", "deep2.md", "deep3.md"} <= names
+              and "deep4.md" not in names)
+        check("load: import cycle doesn't hang or double count",
+              sum(1 for e in L["entries"] if e["path"].endswith("team.md")) == 1)
+        check("load: imports in code spans and fenced blocks ignored", not names & {"ignored.md", "fenced.md"})
+        check("load: missing import reported", any("missing.md" in w for w in L["warnings"]))
+        check("load: email address not taken for an import", not any("b.com" in w for w in L["warnings"]))
+        md_entry = next(e for e in L["entries"] if e["path"] == str(c2 / "CLAUDE.md"))
+        check("load: HTML comments not counted", md_entry["chars"] < len((c2 / "CLAUDE.md").read_text()) - 400)
+        check("load: rule without paths counted, rule with paths not", "always.md" in names and "py.md" not in names)
+        sk = next((e for e in L["entries"] if "skills and subagents" in e["label"]), {})
+        check("load: only skill frontmatter counted, manual-only skill skipped",
+              sk.get("label", "").endswith("(1)") and 0 < sk.get("chars", 0) < 100)
+        check("load: tokens are characters / 4", L["tokens"] == round(L["chars"] / 4))
+        La = startup_load(env2, "p:" + str(pa))
+        na = [e["path"] for e in La["entries"]]
+        check("load: project CLAUDE.md counted, its AGENTS.md not", str(pa / "CLAUDE.md") in na
+              and str(pa / "AGENTS.md") not in na)
+        me = next((e for e in La["entries"] if e["path"].endswith("MEMORY.md")), {})
+        check("load: auto memory capped at 200 lines", me.get("chars") == len("".join(f"note {i}\n" for i in range(200)))
+              and any("first 200 lines" in w for w in La["warnings"]))
+        Lb = startup_load(env2, "p:" + str(pb))
+        check("load: AGENTS.md loads when there's no CLAUDE.md, with a warning",
+              str(pb / "AGENTS.md") in [e["path"] for e in Lb["entries"]] and any("AGENTS.md" in w for w in Lb["warnings"]))
+        try:
+            startup_load(env2, "p:/nope")
+            check("load: unknown section refused", False)
+        except ApiError as e:
+            check("load: unknown section refused", e.status == 404)
+
+        D = find_drift(env2)
+        dp = {(Path(p["a"]).relative_to(h2).as_posix(), Path(p["b"]).relative_to(h2).as_posix()) for p in D["pairs"]}
+        check("drift: CLAUDE.md vs AGENTS.md that differ is flagged", ("Code/a/AGENTS.md", "Code/a/CLAUDE.md") in dp)
+        check("drift: identical copies not flagged", not any("Code/d" in a for pair in dp for a in pair))
+        check("drift: same-named template siblings not flagged", not any("sys1" in a for pair in dp for a in pair))
+        check("drift: unrelated files not flagged", not any("Code/b" in a for pair in dp for a in pair))
+        cmp = compare_files(env2, str(pa / "CLAUDE.md"), str(pa / "AGENTS.md"))
+        check("compare: diff shows the changed line", "+line 3 changed" in cmp["diff"] and not cmp["same"])
+        try:
+            compare_files(env2, str(pa / "CLAUDE.md"), str(outside))
+            check("compare: unmanaged file refused", False)
+        except ApiError as e:
+            check("compare: unmanaged file refused", e.status == 403)
+
+        t2 = discover(env2)
+        all2 = {it["path"]: it for it in iter_files(t2)}
+        check("scripts: hook in ~/.claude/hooks listed", all2.get(str(c2 / "hooks/guard.py"), {}).get("kind") == "user_scripts")
+        check("scripts: status line script outside .claude listed", str(h2 / "bin/status.sh") in all2)
+        check("scripts: script outside the home folder not listed", str(outside) not in all2)
+        check("home-folder settings.local.json listed", all2.get(str(c2 / "settings.local.json"), {}).get("kind")
+              == "user_settings_local")
+        pl = str(c2 / "plugins/installed_plugins.json")
+        check("plugins list shown read-only", all2.get(pl, {}).get("readonly") is True)
+        try:
+            save_file(env2, pl, "{}", None)
+            check("plugins list can't be saved", False)
+        except ApiError as e:
+            check("plugins list can't be saved", e.status == 403)
+        r2 = read_file(env2, str(h2 / "bin/status.sh"))
+        check("scripts: can be opened", r2["content"] == "echo status\n")
+
+        st = {s["label"]: s for s in find_strays(env2)}
+        check("tidy: hand-made copies found", set(st) == {"~/.claude/settings.json.bak-1", "~/.claude/CLAUDE.md.old-copy",
+                                                         "~/Code/a/CLAUDE.md~"})
+        check("tidy: settings.json5 isn't taken for a copy", "~/.claude/settings.json5" not in st)
+        check("tidy: copy mentioned in CLAUDE.md is flagged",
+              st["~/.claude/settings.json.bak-1"]["referenced_in"] == ["~/.claude/CLAUDE.md"]
+              and st["~/.claude/CLAUDE.md.old-copy"]["referenced_in"] == [])
+        try:
+            archive_strays(env2, [str(c2 / "CLAUDE.md")])
+            check("tidy: archiving a live Claude file refused", False)
+        except ApiError as e:
+            check("tidy: archiving a live Claude file refused", e.status == 403 and (c2 / "CLAUDE.md").is_file())
+        try:
+            archive_strays(env2, [])
+            check("tidy: empty selection refused", False)
+        except ApiError as e:
+            check("tidy: empty selection refused", e.status == 400)
+        bak, oldc = c2 / "settings.json.bak-1", c2 / "CLAUDE.md.old-copy"
+        ar = archive_strays(env2, [str(bak), str(oldc)])
+        lt = list_tidy(env2)
+        check("tidy: archive moves files, nothing deleted", ar["moved"] == 2 and not bak.exists() and not oldc.exists()
+              and len(lt["archived"]) == 2 and all((td / "state2/archive" / a["id"]).is_file() for a in lt["archived"]))
+        a_bak = next(a for a in lt["archived"] if a["original"] == str(bak))
+        a_old = next(a for a in lt["archived"] if a["original"] == str(oldc))
+        restore_archived(env2, a_bak["id"])
+        check("tidy: put back restores the file", bak.read_text() == "{}\n" and len(list_tidy(env2)["archived"]) == 1)
+        try:
+            restore_archived(env2, a_bak["id"])
+            check("tidy: putting back twice refused", False)
+        except ApiError as e:
+            check("tidy: putting back twice refused", e.status == 404)
+        oldc.write_text("someone made a new one\n")
+        try:
+            restore_archived(env2, a_old["id"])
+            check("tidy: put back never overwrites", False)
+        except ApiError as e:
+            check("tidy: put back never overwrites", e.status == 409 and oldc.read_text() == "someone made a new one\n"
+                  and (td / "state2/archive" / a_old["id"]).is_file())
+        try:
+            restore_archived(env2, "../../etc/passwd")
+            check("tidy: bad archive id refused", False)
+        except ApiError as e:
+            check("tidy: bad archive id refused", e.status == 400)
+
+        s, r = call("GET", "/api/load?group=global")
+        check("API: /api/load works", s == 200 and "tokens" in r)
+        s, r = call("GET", "/api/drift")
+        check("API: /api/drift works", s == 200 and "pairs" in r)
+        s, r = call("POST", "/api/tidy/archive", {"paths": [str(cd / "CLAUDE.md")]})
+        check("API: archiving a live file refused", s == 403 and (cd / "CLAUDE.md").is_file())
+        s, r = call("GET", "/api/compare?a=" + quote(str(cd / "CLAUDE.md")) + "&b=" + quote("/etc/hosts"))
+        check("API: compare with an unmanaged file refused", s == 403)
+        check("API: new routes need the token", call("GET", "/api/tidy", tok=None)[0] == 403)
+
         print("Health, stop and rename")
         with urllib.request.urlopen(base + "/health") as rr:
             hj = json.loads(rr.read())
@@ -1942,6 +2572,21 @@ dialog .acts { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wr
 .rv-file { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--muted); cursor: pointer; text-decoration: underline dotted; }
 pre.diff { background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 10px; font-size: 12px; overflow: auto; max-height: 420px; margin: 8px 0; }
 pre.diff .a { color: var(--ok); } pre.diff .d { color: var(--err); } pre.diff .h { color: var(--faint); }
+.load-total { display: flex; align-items: baseline; gap: 10px; margin: 6px 0 10px; }
+.load-total b { font-size: 22px; }
+.load-row { display: grid; grid-template-columns: 1fr 90px; gap: 2px 12px; padding: 8px 14px; border-bottom: 1px solid var(--line); font-size: 13px; }
+.load-row:last-child { border-bottom: 0; }
+.load-row .how { grid-column: 1; font-size: 12px; color: var(--muted); }
+.load-row .tok { grid-column: 2; grid-row: 1 / span 2; text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+.load-bar { grid-column: 1 / span 2; height: 4px; background: var(--chip); border-radius: 2px; overflow: hidden; }
+.load-bar i { display: block; height: 100%; background: var(--accent); }
+.drift-row { display: flex; gap: 10px; align-items: center; padding: 9px 14px; border-bottom: 1px solid var(--line); font-size: 13px; }
+.drift-row:last-child { border-bottom: 0; }
+.drift-row span.files { flex: 1; word-break: break-all; }
+.tidy-row { display: flex; gap: 10px; align-items: flex-start; padding: 9px 14px; border-bottom: 1px solid var(--line); font-size: 13px; }
+.tidy-row:last-child { border-bottom: 0; }
+.tidy-row .lab { flex: 1; word-break: break-all; }
+.list .drift-row .btn, .list .tidy-row .btn { display: inline-block; width: auto; flex: none; border: 1px solid var(--line); padding: 5px 12px; }
 .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: -2px; margin-right: 6px; }
 @keyframes spin { to { transform: rotate(360deg); } }
 #toast { position: fixed; bottom: 18px; right: 18px; background: var(--ink); color: var(--bg); padding: 9px 14px; border-radius: 8px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; max-width: 420px; }
@@ -2030,6 +2675,7 @@ function renderNav() {
   addSection("This Mac");
   renderGroup(nav, g0, q);
   nav.appendChild(rowEl({ label: "Backups (every saved version)", cls: "folder", dot: false, onclick: () => openAllBackups(), selKey: "backups" }));
+  if (TIDY && (TIDY.strays.length || TIDY.archived.length)) nav.appendChild(rowEl({ label: "Tidy up old copies", cls: "folder", dot: false, tag: TIDY.strays.length ? String(TIDY.strays.length) : "", onclick: () => openTidy(), selKey: "tidy" }));
 
   const addBtn = document.createElement("button");
   addBtn.className = "mini"; addBtn.textContent = "+ Add folder"; addBtn.onclick = addFolder;
@@ -2140,8 +2786,11 @@ async function openFile(it, force = false) {
     if (b) b.onclick = () => doCreate(g.id, it.kind, null);
     return;
   }
-  c.innerHTML = head + `<div class="editor-wrap"><div class="toolbar"><span class="status" id="st">Loading…</span><span id="lines" style="color:var(--faint)"></span><span class="spacer"></span><button class="btn" id="hist-btn" title="Earlier versions of this file">History</button>${tree.notReviewed.includes(it.kind) ? "" : `<button class="rv-btn" id="rv-file">✦ Review against best practice</button>`}<button class="btn" id="revert" disabled>Revert</button><button class="btn primary" id="save" disabled>Save  ⌘S</button></div><div id="msgs"></div><textarea id="ed" spellcheck="false"></textarea></div>`;
+  const fd = driftFor([it.path]);
+  const driftNote = fd.length ? `<div class="note">${fd.map((p, i) => `This file looks like a copy of <b class="mono">${esc(p.a === it.path ? p.b_label : p.a_label)}</b> (${Math.round(p.ratio * 100)}% the same), but they differ. <button class="mini" data-cmp="${i}">Compare</button>`).join("<br>")}</div>` : "";
+  c.innerHTML = head + driftNote + `<div class="editor-wrap"><div class="toolbar"><span class="status" id="st">Loading…</span><span id="lines" style="color:var(--faint)"></span><span class="spacer"></span><button class="btn" id="hist-btn" title="Earlier versions of this file">History</button>${tree.notReviewed.includes(it.kind) ? "" : `<button class="rv-btn" id="rv-file">✦ Review against best practice</button>`}<button class="btn" id="revert" disabled>Revert</button><button class="btn primary" id="save" disabled>Save  ⌘S</button></div><div id="msgs"></div><textarea id="ed" spellcheck="false"></textarea></div>`;
   wirePathButtons(c);
+  wireDrift(c, fd);
   let f;
   try { f = await api("GET", "/api/file?path=" + encodeURIComponent(it.path)); }
   catch (e) { $("#st").textContent = e.message; $("#st").style.color = "var(--err)"; return; }
@@ -2259,6 +2908,7 @@ async function openGroup(g) {
   }[g.scope];
   c.innerHTML = `<div class="crumbs">${esc(g.scope === "project" ? "Project" : "Section")}</div><h2>${esc(g.title)}</h2>${g.path ? pathLine(g.path) : `<div class="pathline"><code>${esc(g.subtitle)}</code></div>`}
     <div class="note">${md(desc)}${g.note ? "<br><br>" + md(g.note) : ""}</div>
+    <div id="load-box"></div><div id="drift-g"></div>
     ${g.source === "added" ? `<p><button class="btn" id="rm">Remove from list</button> <span style="color:var(--faint);font-size:12px">Only removes it from this app. No files are touched.</span></p>` : ""}
     ${g.source === "claude" || g.source === "both" ? `<p style="color:var(--faint);font-size:12px">Listed because you've opened Claude Code in this folder (from ~/.claude.json).</p>` : ""}
     ${exist.length ? `<p><button class="rv-btn" id="rv-group">✦ Review ${g.scope === "project" ? "this project" : "this section"} against best practice</button> <span style="color:var(--faint);font-size:12px">Fetches Anthropic's current guidance and checks all these files together.</span></p>` : ""}
@@ -2268,6 +2918,9 @@ async function openGroup(g) {
   const fill = (id, arr) => { const l = $("#" + id, c); if (!l) return; if (!arr.length) l.innerHTML = `<div style="padding:14px;color:var(--faint)">None.</div>`;
     arr.forEach(it => { const k = tree.kinds[it.kind]; const b = document.createElement("button"); b.innerHTML = `<span class="dot${it.exists ? (it.readonly ? " ro" : "") : ""}" style="${it.exists ? "" : "background:transparent;border:1.5px solid var(--faint)"}"></span><span style="flex:1"><span class="mono" style="font-size:13px">${esc(it.label)}</span><br><span style="font-size:12px;color:var(--muted)">${esc(k.title)}</span></span><span class="tag" style="font-size:11px;color:var(--faint)">${esc(k.loads)}</span>`; b.onclick = () => openFile(it); l.appendChild(b); }); };
   fill("ex", exist); fill("mi", missing);
+  if (g.scope === "global" || (g.scope === "project" && !g.missing)) renderLoad(g);
+  const dp = driftFor(exist.map(i => i.path));
+  if (dp.length) { const d = $("#drift-g", c); d.innerHTML = `<h4 style="margin:18px 0 8px">Files here that have drifted apart (${dp.length})</h4>` + driftListHtml(dp); wireDrift(d, dp); }
   const rvg = $("#rv-group", c); if (rvg) rvg.onclick = () => startReview({ group: g.id });
   const rm = $("#rm", c);
   if (rm) rm.onclick = async () => { await api("POST", "/api/folders/remove", { path: g.path }); toast("Removed from list"); await load(); welcome(); };
@@ -2300,13 +2953,14 @@ function welcome() {
     <h2>DotClaude</h2>
     <p style="color:var(--muted)">Every file Claude Code reads on this Mac, with an explanation of what each one does. Pick a file on the left to read or edit it. A backup of the old version is saved in <code>~/.dotclaude/backups/</code> every time you save.</p>
     <div class="stats"><div class="stat"><b>${files}</b>files found</div><div class="stat"><b>${tree.projects.length}</b>projects</div></div>
+    ${DRIFT && DRIFT.pairs.length ? `<h3 style="margin-top:22px">Files that have drifted apart (${DRIFT.pairs.length})</h3><p style="color:var(--muted)">Each pair looks like one set of instructions kept under two names, such as CLAUDE.md and AGENTS.md, but they no longer match. Claude Code and other tools may be getting different instructions.</p><div id="drift-w">${driftListHtml(DRIFT.pairs)}</div>` : ""}
     <div class="legend"><span><span class="dot"></span> exists</span><span><span class="dot ro"></span> read-only</span><span><span class="dot" style="background:transparent;border:1.5px solid var(--faint)"></span> doesn't exist yet (you can add it)</span></div>
     <h3 style="margin-top:26px">What Claude Code loads when a session starts</h3>
     <ol>
       <li><b>Organisation files</b> (if an administrator installed any)</li>
       <li><b>Your global</b> <code>~/.claude/CLAUDE.md</code> and <code>~/.claude/rules/</code></li>
       <li><b>CLAUDE.md files in parent folders</b> above the project</li>
-      <li><b>The project's</b> <code>CLAUDE.md</code> / <code>.claude/CLAUDE.md</code>, plus your private <code>CLAUDE.local.md</code></li>
+      <li><b>The project's</b> <code>CLAUDE.md</code> / <code>.claude/CLAUDE.md</code>, plus your private <code>CLAUDE.local.md</code>. If there's none of these in the folder or any folder above it, <code>AGENTS.md</code> loads instead</li>
       <li><b>Project rules</b> in <code>.claude/rules/</code> (rules with <code>paths:</code> wait until matching files come up)</li>
       <li><b>Auto memory</b>: the first 200 lines of the project's <code>MEMORY.md</code></li>
       <li><b>Skills and subagents</b>: only their names and descriptions, until one is used</li>
@@ -2314,8 +2968,69 @@ function welcome() {
     <p>Later, when it's needed: <b>subfolder CLAUDE.md files</b>, auto-memory topic files, and the full text of skills.</p>
     <h3 style="margin-top:22px">Which settings win</h3>
     <p>Organisation → command-line flags → <code>.claude/settings.local.json</code> → <code>.claude/settings.json</code> → <code>~/.claude/settings.json</code>. Lists such as permission rules are combined across all of them.</p>
+    <p>Open any project (or <b>About this section</b> under Global) to see how much of this loads there, file by file.</p>
     <p style="color:var(--faint);font-size:12px;margin-top:26px">Based on the Claude Code docs: <a href="https://code.claude.com/docs/en/memory.md" target="_blank" rel="noopener">Memory</a> · <a href="https://code.claude.com/docs/en/settings.md" target="_blank" rel="noopener">Settings</a> · <a href="https://code.claude.com/docs/en/claude-directory.md" target="_blank" rel="noopener">The .claude directory</a></p>
   </section></div>`;
+  if (DRIFT && DRIFT.pairs.length) wireDrift($("#content"), DRIFT.pairs);
+}
+
+/* ---------------- What loads, drift, tidy ---------------- */
+async function renderLoad(g) {
+  const box = $("#load-box"); if (!box) return;
+  const title = `<h4 style="margin:18px 0 4px">What loads at the start of every session${g.scope === "global" ? ", in every project" : " here"}</h4>`;
+  box.innerHTML = title + `<div class="rv-meta">Measuring…</div>`;
+  let L;
+  try { L = await api("GET", "/api/load?group=" + encodeURIComponent(g.id)); } catch (e) { box.innerHTML = title + `<div class="rv-meta">${esc(e.message)}</div>`; return; }
+  if ($("#load-box") !== box) return;  // user moved on
+  const max = Math.max(1, ...L.entries.map(e => e.chars));
+  box.innerHTML = title + `<div class="load-total"><b>≈ ${L.tokens.toLocaleString()} tokens</b><span class="rv-meta">${fmtSize(L.chars)} of text, before you type anything</span></div>
+    ${L.warnings.map(w => `<div class="msg warn" style="border:0;padding:2px 0 6px">${md(w)}</div>`).join("")}
+    <div class="list">${L.entries.map((e, i) => `<div class="load-row" data-i="${i}" style="${findItem(e.path) ? "cursor:pointer" : ""}"><span class="mono" style="word-break:break-all">${esc(e.label)}</span><span class="tok">≈ ${e.tokens.toLocaleString()}</span><span class="how">${esc(e.how)}${e.via ? ` · from ${esc(e.via)}` : ""}</span><span class="load-bar"><i style="width:${(100 * e.chars / max).toFixed(1)}%"></i></span></div>`).join("") || `<div style="padding:14px;color:var(--faint)">Nothing loads here.</div>`}</div>
+    <p class="rv-meta" style="margin-top:6px">Estimate: ${esc(L.estimate)} Not counted: ${esc(L.not_counted)}</p>`;
+  box.querySelectorAll(".load-row").forEach(r => { const it = findItem(L.entries[+r.dataset.i].path); if (it) r.onclick = () => openFile(it); });
+}
+
+async function openCompare(p) {
+  if (!(await guardDirty())) return;
+  cur = null; markSel("compare");
+  const c = $("#content");
+  c.innerHTML = `<div class="crumbs">Drift</div><h2>Compare two files</h2>
+    <div class="note">These look like one set of instructions kept under two names, but they've drifted apart. Lines starting with <b>-</b> are only in the first file, lines starting with <b>+</b> only in the second. Bring the out-of-date one up to date, or keep a single copy: for CLAUDE.md and AGENTS.md, Anthropic's docs suggest a CLAUDE.md that just says <code>@AGENTS.md</code>.</div>
+    <p><button class="btn" id="oa">Open ${esc(p.a_label)}</button> <button class="btn" id="ob">Open ${esc(p.b_label)}</button></p><div id="cmp">Loading…</div>`;
+  $("#oa").onclick = () => { const it = findItem(p.a); if (it) openFile(it); };
+  $("#ob").onclick = () => { const it = findItem(p.b); if (it) openFile(it); };
+  try {
+    const r = await api("GET", `/api/compare?a=${encodeURIComponent(p.a)}&b=${encodeURIComponent(p.b)}`);
+    $("#cmp").innerHTML = r.same ? `<p>They're identical now.</p>` : `<pre class="diff" style="max-height:none">${diffHtml(r.diff)}</pre>`;
+  } catch (e) { $("#cmp").innerHTML = `<p style="color:var(--err)">${esc(e.message)}</p>`; }
+}
+
+async function openTidy() {
+  if (!(await guardDirty())) return;
+  cur = null; markSel("tidy");
+  const c = $("#content");
+  c.innerHTML = `<div class="crumbs">This Mac</div><h2>Tidy up old copies</h2>
+    <div class="note">Copies made by hand next to a Claude file, such as <code>settings.json.bak-…</code>. Claude Code ignores them, and DotClaude already keeps a backup every time you save. Moving them to the archive gets them out of the way. Nothing is deleted, and you can put any of them back.</div><div id="tidy">Loading…</div>`;
+  let t;
+  try { t = await api("GET", "/api/tidy"); } catch (e) { $("#tidy").textContent = e.message; return; }
+  const box = $("#tidy");
+  box.innerHTML = (t.strays.length ? `<div class="list">${t.strays.map((s, i) => `<label class="tidy-row"><input type="checkbox" data-i="${i}" ${s.referenced_in.length ? "" : "checked"}><span class="lab"><span class="mono">${esc(s.label)}</span><br><span class="rv-meta">Copy of ${esc(s.of)} · ${fmtSize(s.size)} · ${esc(fmtTime(s.mtime))}</span>${s.referenced_in.length ? `<br><span style="color:var(--warn);font-size:12px">Mentioned by name in ${esc(s.referenced_in.join(", "))}. Moving it would break that reference, so it isn't ticked.</span>` : ""}</span></label>`).join("")}</div>
+      <p style="margin-top:10px"><button class="btn primary" id="arch">Move ticked files to the archive</button> <span class="rv-meta">They go to <code>${esc(t.dir)}</code>.</span></p>` : `<div class="note">No old copies found.</div>`)
+    + (t.archived.length ? `<h4 style="margin:22px 0 8px">In the archive (${t.archived.length})</h4><div class="list">${t.archived.map((a, i) => `<div class="tidy-row"><span class="lab"><span class="mono">${esc(a.label)}</span><br><span class="rv-meta">Archived ${esc(fmtTime(a.time))}</span></span><button class="btn" data-put="${i}">Put back</button></div>`).join("")}</div>` : "");
+  const arch = $("#arch", box);
+  if (arch) arch.onclick = async () => {
+    const paths = [...box.querySelectorAll("input[data-i]:checked")].map(x => t.strays[+x.dataset.i].path);
+    if (!paths.length) { toast("Tick at least one file."); return; }
+    const a = await ask({ title: `Move ${paths.length} file${paths.length === 1 ? "" : "s"} to the archive?`, text: `They move to <code>${esc(t.dir)}</code>. You can put each one back from this page.`, buttons: [{ label: "Cancel", value: null }, { label: "Move", value: "go", primary: true }] });
+    if (!a || a.value !== "go") return;
+    try { const r = await api("POST", "/api/tidy/archive", { paths }); toast(`Moved ${r.moved} to the archive`); await load(); openTidy(); }
+    catch (e) { toast(e.message, 4500); }
+  };
+  box.querySelectorAll("[data-put]").forEach(b => b.onclick = async () => {
+    const a = t.archived[+b.dataset.put];
+    try { await api("POST", "/api/tidy/restore", { id: a.id }); toast("Put back " + a.label); await load(); openTidy(); }
+    catch (e) { toast(e.message, 4500); }
+  });
 }
 
 /* ---------------- Backups ---------------- */
@@ -2506,7 +3221,19 @@ async function tweakRewrite(i) {
   $("#msgs").insertAdjacentHTML("afterbegin", `<div class="msg warn">The suggested rewrite is loaded but not saved yet. Edit it if you want, then Save (the current version gets backed up first), or Revert to throw it away.</div>`);
 }
 
-async function load() { tree = await api("GET", "/api/tree"); renderNav(); }
+let DRIFT = null, TIDY = null;  // filled in the background after each scan
+async function load() {
+  tree = await api("GET", "/api/tree"); renderNav();
+  DRIFT = null; TIDY = null;
+  api("GET", "/api/drift").then(d => { DRIFT = d; onExtras(); }).catch(() => {});
+  api("GET", "/api/tidy").then(t => { TIDY = t; renderNav(); }).catch(() => {});
+}
+function onExtras() { if (!cur && sel === null && $(".welcome")) welcome(); }
+function driftFor(paths) { return DRIFT ? DRIFT.pairs.filter(p => paths.includes(p.a) || paths.includes(p.b)) : []; }
+function driftListHtml(pairs) {
+  return `<div class="list">${pairs.map((p, i) => `<div class="drift-row"><span class="files"><span class="mono">${esc(p.a_label)}</span> and <span class="mono">${esc(p.b_label)}</span><br><span class="rv-meta">${Math.round(p.ratio * 100)}% the same · ${p.changed_lines} line${p.changed_lines === 1 ? "" : "s"} differ</span></span><button class="btn" data-cmp="${i}">Compare</button></div>`).join("")}</div>`;
+}
+function wireDrift(root, pairs) { root.querySelectorAll("[data-cmp]").forEach(b => b.onclick = () => openCompare(pairs[+b.dataset.cmp])); }
 
 $("#show-missing").checked = S.showMissing;
 $("#show-missing").onchange = e => { S.showMissing = e.target.checked; persist(); renderNav(); };

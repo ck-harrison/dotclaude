@@ -24,8 +24,24 @@ From AIHQ: **Workspace → DotClaude ↗** in the sidebar launches it if needed 
 
 ## What it shows
 
-- **Global**: `~/.claude/` (CLAUDE.md, settings.json, keybindings.json, rules, skills, agents, commands, output styles, workflows, themes, subagent memory) and `~/.claude.json` (read-only)
-- **Projects**: every folder you've opened Claude Code in (read from `~/.claude.json`), plus any folders you add. For each one: CLAUDE.md, .claude/CLAUDE.md, CLAUDE.local.md, AGENTS.md, settings files, .mcp.json, rules/skills/agents/commands, auto memory, CLAUDE.md files inherited from parent folders, and subfolder CLAUDE.md files
+- **Global**: `~/.claude/` (CLAUDE.md, settings.json, settings.local.json, keybindings.json, rules, skills, agents, commands, output styles, workflows, themes, subagent memory, hook and status line scripts), the installed plugins list (read-only) and `~/.claude.json` (read-only)
+- **Projects**: every folder you've opened Claude Code in (read from `~/.claude.json`), plus any folders you add. For each one: CLAUDE.md, .claude/CLAUDE.md, CLAUDE.local.md, AGENTS.md, settings files, .mcp.json, rules/skills/agents/commands, hook scripts, auto memory, CLAUDE.md files inherited from parent folders, and subfolder CLAUDE.md files
+
+Hook and status line scripts are the files in `.claude/hooks/` plus any script a settings file runs as a hook or status line. Only scripts inside your home folder are listed.
+
+## What loads at startup
+
+Open a project (or **About this section** under Global) to see what Claude Code loads at the start of every session there, file by file, with a size estimate. It follows the rules in Anthropic's [memory docs](https://code.claude.com/docs/en/memory.md): CLAUDE.md files in the folder and every folder above it, `@imports` up to 4 hops deep, AGENTS.md only when there's no CLAUDE.md in the folder or above, rules without `paths:`, the first 200 lines of auto memory, and only the descriptions of skills and subagents. It warns about imports that point to missing files.
+
+The token count is an estimate (characters ÷ 4). It leaves out Claude Code's own instructions, MCP tool lists and skills that plugins add.
+
+## Drift
+
+The home page lists instruction files that look like one file kept under two names but no longer match: CLAUDE.md beside AGENTS.md, CLAUDE.md beside .claude/CLAUDE.md, or `~/.claude/CLAUDE.md` beside `~/AGENTS.md`. **Compare** shows the differences. Similar files in different folders (one template filled in per project) aren't flagged.
+
+## Tidy up old copies
+
+**Tidy up old copies** (sidebar, under Global) lists hand-made copies sitting next to a Claude file, such as `settings.json.bak-2026…` or `CLAUDE.md.v1-backup`. Ticked files move to `~/.dotclaude/archive/`, never deleted, and **Put back** returns any of them. A copy that one of your instruction files mentions by name starts unticked, because moving it would break that reference.
 - **Claude desktop app**: `claude_desktop_config.json` (MCP servers for the chat app). Your claude.ai Projects are stored in your account, not on your Mac, so they don't appear here
 - **Organisation-managed**: `/Library/Application Support/ClaudeCode/` (read-only)
 
@@ -69,4 +85,4 @@ Folders you add are stored in `~/.dotclaude/config.json`. If you used it when it
 python3 ~/Code/dotclaude/dotclaude.py --self-test
 ```
 
-This builds a fake home folder in a temp directory and runs 94 checks (using a fake `claude` command for the review tests). They include cases that must fail: bad tokens, path traversal, invalid JSON, writes to read-only files, stale edits, a failing or missing `claude` command, rewrites aimed at files outside the review, a shutdown without the token, backup ids that try to escape the backups folder, restores onto read-only or unmanaged files, and the move from the old ~/.claude-files folder.
+This builds fake home folders in a temp directory and runs 136 checks (using a fake `claude` command for the review tests). They include cases that must fail: bad tokens, path traversal, invalid JSON, writes to read-only files, stale edits, a failing or missing `claude` command, rewrites aimed at files outside the review, a shutdown without the token, backup ids that try to escape the backups folder, restores onto read-only or unmanaged files, the move from the old ~/.claude-files folder, imports past 4 hops or inside code blocks, rules with `paths:`, drift between unrelated or identical files, scripts outside the home folder, saving the plugins list, archiving a live Claude file, and putting an archived file back over a newer one.
