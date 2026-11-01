@@ -2672,7 +2672,14 @@ print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "re
         s, r = call("POST", "/api/shutdown", {})
         check("shutdown with token stops the server", s == 200 and srv.stopped.wait(5))
 
-    failed = [n for n, ok in results if not ok]
+    readme = Path(__file__).with_name("README.md")
+    if readme.is_file():
+        m = re.search(r"runs (\d+) checks", readme.read_text(encoding="utf-8"))
+        stated = int(m.group(1)) if m else None
+        # +1 counts this check itself
+        check(f"README states the check count ({stated} vs {len(results) + 1})", stated == len(results) + 1)
+
+    failed =[n for n, ok in results if not ok]
     print(f"\n{len(results) - len(failed)}/{len(results)} checks passed")
     return 1 if failed else 0
 
