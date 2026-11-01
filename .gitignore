@@ -3,3 +3,5 @@ __pycache__/
 .DS_Store
 .venv/
 venv/
+# upload copies of the tile SVGs (identical to the .svg files)
+*.svg.txt

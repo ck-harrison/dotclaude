@@ -7,10 +7,10 @@
 #   bash make-dock-app.sh /some/dir       # build somewhere else
 #
 # Re-runnable: the bundle is rebuilt from scratch every time, so fixes go here,
-# never into the .app by hand. Modelled on AIHQ's scripts/make-dock-app.sh.
+# never into the .app by hand.
 #
-# The app accepts --no-browser (AIHQ uses it: `open -a DotClaude --args
-# --no-browser`, then opens the page itself).
+# The app accepts --no-browser (`open -a DotClaude --args --no-browser`) for
+# tools that want to start it and open the page themselves.
 set -euo pipefail
 
 APP_NAME="DotClaude"

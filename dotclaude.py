@@ -1983,7 +1983,7 @@ def make_handler(env: Env, token: str, port_ref: dict):
                 return
             u = urlparse(self.path)
             q = parse_qs(u.query)
-            if u.path == "/health":  # no token: lets AIHQ (or a launcher) see that DotClaude is up
+            if u.path == "/health":  # no token: lets a launcher or another local tool see that DotClaude is up
                 self._send(200, {"app": "dotclaude", "version": APP_VERSION, "url": f"http://127.0.0.1:{port_ref['port']}/"})
             elif u.path == "/":
                 html = PAGE.replace("__TOKEN__", token)
@@ -3584,7 +3584,7 @@ $("#refresh").onclick = async () => { await load(); toast("Rescanned"); };
 $("#stop").onclick = async () => {
   if (RV && RV.status === "running") { toast("A review is running. Cancel it or wait before stopping."); return; }
   if (!(await guardDirty())) return;
-  const a = await ask({ title: "Stop DotClaude?", text: "This closes the app. Open it again from the Dock or from AIHQ.", buttons: [{ label: "Cancel", value: null }, { label: "Stop", value: "stop", primary: true }] });
+  const a = await ask({ title: "Stop DotClaude?", text: "This closes the app. Open it again from the Dock or from Terminal.", buttons: [{ label: "Cancel", value: null }, { label: "Stop", value: "stop", primary: true }] });
   if (!a || a.value !== "stop") return;
   try { await api("POST", "/api/shutdown"); } catch (e) {}
   if (cur) cur.dirty = false;
