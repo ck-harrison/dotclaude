@@ -480,6 +480,55 @@ for _p, _u in [("proj_rules", "user_rules"), ("proj_skills", "user_skills"), ("p
 for _w, (_why, _missing) in KIND_WHY.items():
     KINDS[_w]["why"], KINDS[_w]["missing"] = _why, _missing
 
+# Plain-English names for the sidebar; the file name is shown beside them in small type.
+# "section" groups files on overview pages.
+KIND_SHORT: Dict[str, tuple] = {
+    "user_claude_md": ("Your instructions", "Instructions"),
+    "user_settings": ("Settings", "Settings and tools"),
+    "keybindings": ("Keyboard shortcuts", "Settings and tools"),
+    "user_rules": ("Rules", "Instructions"),
+    "user_skills": ("Skills", "Skills and helpers"),
+    "user_agents": ("Subagents", "Skills and helpers"),
+    "user_commands": ("Old-style slash commands", "Skills and helpers"),
+    "user_output_styles": ("Output styles", "Skills and helpers"),
+    "user_workflows": ("Workflows", "Skills and helpers"),
+    "user_themes": ("Colour themes", "Settings and tools"),
+    "user_agent_memory": ("Subagent memory", "Memory"),
+    "user_settings_local": ("Home-folder settings", "Settings and tools"),
+    "user_plugins": ("Installed plugins", "Settings and tools"),
+    "user_scripts": ("Hook scripts", "Settings and tools"),
+    "proj_scripts": ("Hook scripts", "Settings and tools"),
+    "claude_json": ("Claude Code app state", "Settings and tools"),
+    "automem_orphan": ("Leftover memory folders", "Memory"),
+    "managed_claude_md": ("Organisation instructions", "Instructions"),
+    "managed_settings": ("Organisation settings", "Settings and tools"),
+    "managed_mcp": ("Organisation MCP servers", "Settings and tools"),
+    "desktop_config": ("MCP servers for the chat", "Settings and tools"),
+    "desktop_app_config": ("App preferences", "Settings and tools"),
+    "proj_claude_md": ("Instructions", "Instructions"),
+    "proj_dot_claude_md": ("Instructions (in .claude)", "Instructions"),
+    "proj_local_md": ("Your private notes", "Instructions"),
+    "proj_agents_md": ("Instructions for other AI tools", "Instructions"),
+    "proj_settings": ("Settings (shared)", "Settings and tools"),
+    "proj_settings_local": ("Settings (just you)", "Settings and tools"),
+    "proj_mcp": ("MCP servers", "Settings and tools"),
+    "proj_worktreeinclude": ("Files copied to worktrees", "Settings and tools"),
+    "proj_rules": ("Rules", "Instructions"),
+    "proj_skills": ("Skills", "Skills and helpers"),
+    "proj_agents": ("Subagents", "Skills and helpers"),
+    "proj_commands": ("Old-style slash commands", "Skills and helpers"),
+    "proj_output_styles": ("Output styles", "Skills and helpers"),
+    "proj_workflows": ("Workflows", "Skills and helpers"),
+    "proj_agent_memory": ("Subagent memory (shared)", "Memory"),
+    "proj_agent_memory_local": ("Subagent memory (just you)", "Memory"),
+    "automem_index": ("Claude's memory", "Memory"),
+    "automem_topics": ("Memory notes", "Memory"),
+    "parent_md": ("From parent folders", "Instructions"),
+    "sub_md": ("Subfolder instructions", "Instructions"),
+}
+for _w, (_short, _section) in KIND_SHORT.items():
+    KINDS[_w]["short"], KINDS[_w]["section"] = _short, _section
+
 # File specs: (kind, path relative to scope root, show when missing)
 GLOBAL_FILES = [("user_claude_md", "CLAUDE.md", True), ("user_settings", "settings.json", True),
                 ("user_settings_local", "settings.local.json", False),
@@ -777,8 +826,17 @@ def discover(env: Env) -> dict:
     projs, hidden_wt = project_paths(env)
     matched_mem = set()
     project_groups = []
+    hidden_set = set(env.load_config().get("hidden_projects", []))
+    hidden_projects = []
     for pr in projs:
         p = pr["path"]
+        if str(p) in hidden_set:
+            # Hidden: not listed, but its memory folders still count as matched (not "unmatched")
+            hidden_projects.append({"path": str(p), "title": p.name or str(p), "subtitle": tilde(env, p)})
+            for cand in [p] + [Path(a) for a in pr.get("aliases", [])]:
+                matched_mem.add(str(env.claude_dir / "projects" / encode_project_key(cand) / "memory"))
+            matched_mem.add(str(automem_dir(env, p, pr.get("aliases", []))))
+            continue
         gid = "p:" + str(p)
         pg = {"id": gid, "scope": "project", "title": p.name or str(p), "subtitle": tilde(env, p),
               "path": str(p), "source": pr["source"], "items": [], "missing": bool(pr.get("missing"))}
@@ -891,6 +949,7 @@ def discover(env: Env) -> dict:
     groups.append(mg)
 
     return {"groups": groups, "projects": project_groups, "hiddenWorktrees": hidden_wt,
+            "hiddenProjects": hidden_projects,
             "kinds": KINDS,
             "home": str(env.home), "version": APP_VERSION, "docsBase": DOCS,
             "notReviewed": sorted(NOT_REVIEWED)}
@@ -1582,6 +1641,25 @@ def remove_folder(env: Env, path: str) -> dict:
     return {"ok": True}
 
 
+def set_project_hidden(env: Env, path: str, hidden: bool) -> dict:
+    """Hide a project from DotClaude's lists, or show it again. Only changes ~/.dotclaude/config.json."""
+    cfg = env.load_config()
+    cur = cfg.get("hidden_projects", [])
+    if hidden:
+        known = {str(pr["path"]) for pr in project_paths(env)[0]}
+        if path not in known:
+            raise ApiError(404, "That project isn't in the list.")
+        if path not in cur:
+            cur.append(path)
+    else:
+        if path not in cur:
+            raise ApiError(404, "That project isn't hidden.")
+        cur = [p for p in cur if p != path]
+    cfg["hidden_projects"] = cur
+    env.save_config(cfg)
+    return {"ok": True, "hidden": cur}
+
+
 def pick_folder() -> dict:
     if sys.platform != "darwin":
         raise ApiError(501, "The folder picker only works on macOS. Type the path instead.")
@@ -1890,6 +1968,10 @@ def _reviewable_files(env: Env, tree: dict) -> List[dict]:
             and not it["readonly"]]
 
 
+# Claude writes these notes itself, so flagging them "to review" after a guidance change is noise.
+NOT_BEHIND = {"automem_topics", "automem_index", "automem_orphan"}
+
+
 def guidance_status(env: Env) -> dict:
     state = _guidance_state(env)
     tree = discover(env)
@@ -1909,6 +1991,8 @@ def guidance_status(env: Env) -> dict:
                       "used_for": sorted(used[key])})
     behind = []
     for it in _reviewable_files(env, tree):
+        if it["kind"] in NOT_BEHIND:
+            continue
         mtime = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(Path(it["path"]).stat().st_mtime))
         newer = [k for k in guidance_keys_for({it["kind"]}) if (state.get(k) or {}).get("changed")
                  and state[k]["changed"] > mtime]
@@ -2248,6 +2332,8 @@ def make_handler(env: Env, token: str, port_ref: dict):
                 "/api/create": lambda: create_file(env, body.get("group", ""), body.get("kind", ""), body.get("name")),
                 "/api/folders/add": lambda: add_folder(env, body.get("path", "")),
                 "/api/folders/remove": lambda: remove_folder(env, body.get("path", "")),
+                "/api/projects/hide": lambda: set_project_hidden(env, body.get("path", ""), True),
+                "/api/projects/unhide": lambda: set_project_hidden(env, body.get("path", ""), False),
                 "/api/pick-folder": pick_folder,
                 "/api/reveal": lambda: reveal(env, body.get("path", "")),
                 "/api/shutdown": request_shutdown,
@@ -2312,6 +2398,8 @@ def self_test() -> int:
         print(("  PASS  " if cond else "  FAIL  ") + name)
 
     print("File type descriptions")
+    no_short = [k for k, v in KINDS.items() if not v.get("short") or not v.get("section")]
+    check(f"every file type has a plain-English name and a section (missing: {no_short})", not no_short)
     no_why = [k for k, v in KINDS.items() if not (v.get("why") or "").strip() or not (v.get("missing") or "").strip()]
     check(f"every file type says why you'd want it and what's lost without it (missing: {no_why})", not no_why)
     dashed = [k for k, v in KINDS.items() if any("—" in str(v.get(f, "")) for f in
@@ -2820,6 +2908,29 @@ print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "re
         restore_archived(env2, dr["id"])
         check("delete: put back restores it", live.read_text() == live_text)
 
+        pa_path = next(g["path"] for g in discover(env2)["projects"] if g["title"] == pa.name)
+        try:
+            set_project_hidden(env2, str(h2 / "not-a-project"), True)
+            check("hide: a folder that isn't a project refused", False)
+        except ApiError as e:
+            check("hide: a folder that isn't a project refused", e.status == 404)
+        set_project_hidden(env2, pa_path, True)
+        t_h = discover(env2)
+        orphan_paths = {c["path"] for g in t_h["groups"] for it in g["items"] if it["kind"] == "automem_orphan"
+                        for c in it.get("children", [])}
+        check("hide: project leaves the list and shows under hidden", pa_path not in {g["path"] for g in t_h["projects"]}
+              and [h["path"] for h in t_h["hiddenProjects"]] == [pa_path])
+        check("hide: its memory isn't reported as unmatched", not any(str(mem2) in o for o in orphan_paths))
+        check("hide: no files touched", (pa / "CLAUDE.md").is_file() and (mem2 / "MEMORY.md").is_file())
+        set_project_hidden(env2, pa_path, False)
+        check("hide: showing it again restores it", pa_path in {g["path"] for g in discover(env2)["projects"]}
+              and not discover(env2)["hiddenProjects"])
+        try:
+            set_project_hidden(env2, pa_path, False)
+            check("hide: showing a project that isn't hidden refused", False)
+        except ApiError as e:
+            check("hide: showing a project that isn't hidden refused", e.status == 404)
+
         print("Best-practice benchmark tracking (fake web)")
         pages = {url: f"# {title}\n" + "guidance line\n" * 30 for title, url in GUIDANCE.values()}
         fake = lambda url: pages[url]
@@ -3004,15 +3115,23 @@ a { color: var(--accent); }
 .side-opts { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; font-size: 12px; color: var(--muted); }
 .side-opts label { display: flex; gap: 6px; align-items: center; cursor: pointer; }
 #nav { overflow-y: auto; flex: 1; padding: 6px 6px 40px; }
-.sec-title { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--faint); padding: 14px 8px 4px; display: flex; justify-content: space-between; align-items: center; }
+.sec-title { font-size: 12px; font-weight: 600; color: var(--muted); padding: 16px 8px 4px; display: flex; justify-content: space-between; align-items: center; }
 .grp { margin-bottom: 2px; }
-.grp-head { display: flex; align-items: center; gap: 6px; width: 100%; text-align: left; background: none; border: 0; padding: 6px 8px; border-radius: 6px; }
+.grp-head { display: flex; align-items: center; gap: 2px; width: 100%; padding: 0 8px 0 2px; border-radius: 6px; }
 .grp-head:hover { background: var(--hover); }
-.grp-head .caret { width: 10px; color: var(--faint); font-size: 10px; transition: transform .12s; }
+.grp-head.sel { background: var(--sel); }
+.grp-head button { background: none; border: 0; padding: 6px 4px; text-align: left; }
+.grp-head .caret { width: 22px; color: var(--faint); font-size: 10px; transition: transform .12s; flex: none; text-align: center; }
+.grp-head .caret:hover { color: var(--ink); }
 .grp.closed .caret { transform: rotate(-90deg); }
 .grp.closed .grp-body { display: none; }
-.grp-head .t { font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.grp-head .t { font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .grp-head .n { font-size: 11px; color: var(--faint); }
+.row .fname { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px; color: var(--faint); margin-left: 7px; }
+.row.tool { padding-left: 8px; }
+.row.tool .lbl { font-weight: 500; }
+.row.faint .lbl { color: var(--muted); font-weight: 400; }
+.tool-ico { width: 16px; flex: none; text-align: center; color: var(--muted); font-size: 12px; }
 .grp-sub { font-size: 11px; color: var(--faint); padding: 0 8px 4px 24px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; background: none; border: 0; padding: 4px 8px 4px 24px; border-radius: 6px; font-size: 13px; }
 .row:hover { background: var(--hover); }
@@ -3042,13 +3161,19 @@ h2 { font-size: 22px; margin: 0 0 6px; letter-spacing: -.01em; }
 .fact { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
 .fact.wide { grid-column: 1 / -1; }
 .why-missing { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 10px; padding: 12px 14px; margin: 0 0 14px; }
-.why-missing h4 { margin: 0 0 4px; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--faint); font-weight: 600; }
+.why-missing h4 { margin: 0 0 4px; font-size: 13px; color: var(--ink); font-weight: 600; }
+.about { margin: 0 0 12px; }
+.about > summary { cursor: pointer; font-size: 13px; color: var(--muted); padding: 4px 0; width: fit-content; }
+.about > summary:hover { color: var(--ink); }
+.about[open] > summary { margin-bottom: 8px; }
+.about .facts { margin-bottom: 4px; }
+.flag { font-size: 13px; color: var(--muted); background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--warn); border-radius: 8px; padding: 7px 12px; margin-bottom: 8px; }
 .why-missing p { margin: 0; font-size: 14px; }
 .why-missing code { background: var(--code); padding: 0 4px; border-radius: 4px; font-size: 12px; }
-.fact h4 { margin: 0 0 3px; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--faint); font-weight: 600; }
+.fact h4 { margin: 0 0 3px; font-size: 12px; color: var(--muted); font-weight: 600; }
 .fact p { margin: 0; font-size: 13px; }
 .fact code { background: var(--code); padding: 0 4px; border-radius: 4px; font-size: 12px; }
-.editor-wrap { flex: 1; display: flex; flex-direction: column; min-height: 320px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.editor-wrap { flex: 1; display: flex; flex-direction: column; min-height: 420px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
 .toolbar { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-bottom: 1px solid var(--line); font-size: 12px; }
 .toolbar .status { color: var(--muted); }
 .toolbar .status.dirty { color: var(--warn); font-weight: 600; }
@@ -3070,9 +3195,36 @@ textarea#ed[readonly] { color: var(--muted); }
 .empty-card pre { background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 12px; font-size: 12px; overflow: auto; max-height: 260px; }
 .note { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 8px; padding: 10px 14px; font-size: 13px; color: var(--muted); margin-bottom: 16px; }
 .list { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
-.list button { display: flex; width: 100%; text-align: left; gap: 10px; align-items: center; background: none; border: 0; border-bottom: 1px solid var(--line); padding: 9px 14px; }
-.list button:last-child { border-bottom: 0; }
-.list button:hover { background: var(--hover); }
+.list > button { display: flex; width: 100%; text-align: left; gap: 10px; align-items: center; background: none; border: 0; border-bottom: 1px solid var(--line); padding: 9px 14px; }
+.list > button:last-child { border-bottom: 0; }
+.list > button:hover { background: var(--hover); }
+.lede { color: var(--muted); margin: 0 0 14px; max-width: 72ch; }
+h3.sec { font-size: 15px; margin: 24px 0 8px; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 4px 0 6px; }
+.actions:empty { display: none; }
+.list .fname, .sugg .fname { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px; color: var(--faint); }
+.list button .ent { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.list button .preview { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.list button .when { font-size: 11px; color: var(--faint); text-align: right; max-width: 34%; }
+.list button .why-line { font-size: 12px; color: var(--muted); max-width: 55%; }
+.list .count { min-width: 22px; height: 18px; border-radius: 9px; background: var(--chip); color: var(--muted); font-size: 11px; display: inline-flex; align-items: center; justify-content: center; flex: none; }
+.dot.hollow { background: transparent; border: 1.5px solid var(--faint); }
+.sugg { display: flex; flex-direction: column; gap: 8px; }
+.sugg-row { display: flex; gap: 14px; align-items: center; background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 10px; padding: 12px 14px; }
+.sugg-row > div { flex: 1; }
+.sugg-row p { margin: 4px 0 0; font-size: 13px; color: var(--muted); }
+.sugg-row .btn { flex: none; }
+details.more { margin-top: 22px; }
+details.more > summary { cursor: pointer; font-weight: 600; font-size: 15px; padding: 4px 0; }
+details.more[open] > summary { margin-bottom: 10px; }
+.att-row { display: flex; gap: 14px; align-items: flex-start; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+.att-row:last-child { border-bottom: 0; }
+.att-text { flex: 1; min-width: 0; }
+.att-text .rv-meta { display: block; margin-top: 2px; font-size: 13px; }
+.att-text details { margin-top: 8px; }
+.att-text details > summary { cursor: pointer; font-size: 13px; color: var(--accent); }
+.att-text details .list { margin-top: 8px; }
+.att-row > .btn { flex: none; }
 .welcome h2 { font-size: 24px; }
 .welcome ol { padding-left: 20px; }
 .welcome li { margin: 4px 0; }
@@ -3136,7 +3288,7 @@ pre.diff .a { color: var(--ok); } pre.diff .d { color: var(--err); } pre.diff .h
     <h1 id="home-link"><img class="logo" alt="" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+PHJlY3Qgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByeD0iMTQiIGZpbGw9IiNDMjQxMEMiLz48cGF0aCBkPSJNMTYgOWgyMmwxMiAxMnYzMXEwIDQtNCA0SDE2cS00IDAtNC00VjEzcTAtNCA0LTR6IiBmaWxsPSIjRkJGNkYxIi8+PHBhdGggZD0iTTM4IDl2OHEwIDQgNCA0aDh6IiBmaWxsPSIjRTlDOUI1Ii8+PGNpcmNsZSBjeD0iMjUiIGN5PSI0MiIgcj0iOCIgZmlsbD0iI0MyNDEwQyIvPjwvc3ZnPg==">DotClaude</h1>
     <input id="search" placeholder="Filter files…  (⌘K)" autocomplete="off">
     <div class="side-opts">
-      <label><input type="checkbox" id="show-missing"> Show files you could add</label>
+      <label title="Also list files that don't exist yet, so you can create them"><input type="checkbox" id="show-missing"> Show missing files</label>
       <span><button class="mini" id="refresh" title="Rescan">↻ Rescan</button> <button class="mini" id="stop" title="Stop DotClaude">⏻ Stop</button></span>
     </div>
     <div id="rv-banner"></div>
@@ -3193,7 +3345,7 @@ function ask({ title, text = "", input = null, buttons }) {
 function itemMatches(it, g, q) {
   if (!q) return true;
   const k = tree.kinds[it.kind] || {};
-  return [it.label, it.path, k.title, g.title].join(" ").toLowerCase().includes(q);
+  return [it.label, it.path, k.title, k.short, g.title].join(" ").toLowerCase().includes(q);
 }
 function countFiles(g) { let n = 0; g.items.forEach(it => { if (it.type === "file") n += it.exists ? 1 : 0; else n += it.children.length; }); return n; }
 
@@ -3203,21 +3355,26 @@ function renderNav() {
   nav.innerHTML = "";
   const addSection = (title, extra) => { const d = document.createElement("div"); d.className = "sec-title"; d.innerHTML = `<span>${esc(title)}</span>`; if (extra) d.appendChild(extra); nav.appendChild(d); };
 
+  if (!q) {
+    const att = attentionItems().length;
+    nav.appendChild(rowEl({ label: "Home", cls: "tool", icon: "⌂", tag: att ? `${att} to look at` : "", onclick: () => goHome(), selKey: "home" }));
+    nav.appendChild(rowEl({ label: "Best-practice benchmark", cls: "tool", icon: "✦", tag: GUIDE && GUIDE.behind.length ? `${GUIDE.behind.length} to review` : "", onclick: () => openGuidance(), selKey: "guidance", title: "The official pages reviews are judged against, and when they last changed" }));
+    nav.appendChild(rowEl({ label: "Backups", cls: "tool", icon: "↺", onclick: () => openAllBackups(), selKey: "backups", title: "Every saved version of every file" }));
+    if (TIDY && (TIDY.strays.length || TIDY.archived.length)) nav.appendChild(rowEl({ label: "Tidy up and deleted files", cls: "tool", icon: "⌫", tag: TIDY.strays.length ? String(TIDY.strays.length) : "", onclick: () => openTidy(), selKey: "tidy" }));
+  }
+
   const g0 = tree.groups.find(g => g.id === "global");
-  addSection("This Mac");
+  addSection("Every project");
   renderGroup(nav, g0, q);
-  nav.appendChild(rowEl({ label: "Backups (every saved version)", cls: "folder", dot: false, onclick: () => openAllBackups(), selKey: "backups" }));
-  nav.appendChild(rowEl({ label: "Best-practice benchmark", cls: "folder", dot: false, tag: GUIDE && GUIDE.behind.length ? `${GUIDE.behind.length} to review` : "", onclick: () => openGuidance(), selKey: "guidance", title: "The official pages reviews are judged against, and when they last changed" }));
-  if (TIDY && (TIDY.strays.length || TIDY.archived.length)) nav.appendChild(rowEl({ label: "Tidy up old copies", cls: "folder", dot: false, tag: TIDY.strays.length ? String(TIDY.strays.length) : "", onclick: () => openTidy(), selKey: "tidy" }));
 
   const addBtn = document.createElement("button");
-  addBtn.className = "mini"; addBtn.textContent = "+ Add folder"; addBtn.onclick = addFolder;
+  addBtn.className = "mini"; addBtn.textContent = "+ Add folder"; addBtn.title = "Add a folder you haven't opened Claude Code in yet"; addBtn.onclick = addFolder;
   addSection(`Projects (${tree.projects.length})`, addBtn);
   if (!tree.projects.length) { const p = document.createElement("div"); p.className = "grp-sub"; p.style.paddingLeft = "8px"; p.textContent = "No projects yet. Open a folder in Claude Code, or use + Add folder."; nav.appendChild(p); }
   tree.projects.forEach(g => renderGroup(nav, g, q));
-  if (tree.hiddenWorktrees) { const p = document.createElement("div"); p.className = "grp-sub"; p.style.paddingLeft = "8px"; p.textContent = `${tree.hiddenWorktrees} Claude Code worktree folder(s) hidden`; nav.appendChild(p); }
+  if (!q && tree.hiddenProjects.length) nav.appendChild(rowEl({ label: `Hidden projects (${tree.hiddenProjects.length})`, cls: "tool faint", icon: "◌", onclick: () => openHidden(), selKey: "hidden" }));
 
-  addSection("Apps & organisation");
+  addSection("Apps and organisation");
   tree.groups.filter(g => g.id !== "global").forEach(g => renderGroup(nav, g, q));
 }
 
@@ -3236,24 +3393,22 @@ function renderGroup(nav, g, q) {
   const closed = q ? false : (S.closed[g.id] ?? closedDefault);
   const wrap = document.createElement("div");
   wrap.className = "grp" + (closed ? " closed" : "");
-  const head = document.createElement("button");
-  head.className = "grp-head";
+  const head = document.createElement("div");
+  head.className = "grp-head" + (sel === "g:" + g.id ? " sel" : "");
+  head.dataset.key = "g:" + g.id;
   const srcBadge = g.source === "added" ? `<span class="badge">added</span>` : "";
-  head.innerHTML = `<span class="caret">▼</span><span class="t">${esc(g.title)}</span>${srcBadge}<span class="n">${countFiles(g)}</span>`;
-  head.onclick = () => { S.closed[g.id] = !wrap.classList.contains("closed"); persist(); wrap.classList.toggle("closed"); };
-  head.ondblclick = () => openGroup(g);
+  head.innerHTML = `<button class="caret" title="Show or hide its files" aria-label="Show or hide ${esc(g.title)} files">▼</button><button class="t" title="${esc(g.subtitle)}">${esc(g.title)}</button>${srcBadge}<span class="n" title="Files that exist">${countFiles(g)}</span>`;
+  const toggle = open => { const c = open === undefined ? !wrap.classList.contains("closed") : !open; S.closed[g.id] = c; persist(); wrap.classList.toggle("closed", c); };
+  $(".caret", head).onclick = () => toggle();
+  $(".t", head).onclick = () => { toggle(true); openGroup(g); };
   wrap.appendChild(head);
   const body = document.createElement("div");
   body.className = "grp-body";
-  const sub = document.createElement("div");
-  sub.className = "grp-sub"; sub.textContent = g.subtitle; sub.title = g.subtitle;
-  body.appendChild(sub);
-  const info = rowEl({ label: "About this section", cls: "folder", tag: "", dot: false, onclick: () => openGroup(g), selKey: "g:" + g.id });
-  body.appendChild(info);
   vis.forEach(it => {
     if (it.type === "file") body.appendChild(fileRow(it));
     else {
-      body.appendChild(rowEl({ label: it.label, cls: "folder", tag: it.children.length ? String(it.children.length) : (it.canCreate ? "+ new" : ""), fold: true, onclick: () => openFolder(it), selKey: "f:" + it.group + ":" + it.kind }));
+      const k = tree.kinds[it.kind];
+      body.appendChild(rowEl({ label: k.short || it.label, sub: it.label, cls: "folder", tag: it.children.length ? String(it.children.length) : (it.canCreate ? "+ new" : ""), fold: true, onclick: () => openFolder(it), selKey: "f:" + it.group + ":" + it.kind, title: tilde(it.path) }));
       (it._kids || []).forEach(c => body.appendChild(fileRow(c, true)));
     }
   });
@@ -3261,20 +3416,25 @@ function renderGroup(nav, g, q) {
   nav.appendChild(wrap);
 }
 
-function rowEl({ label, cls = "", tag = "", dot = true, roDot = false, fold = false, onclick, selKey, title }) {
+const isFileName = s => /[./]/.test(s) && !/\s/.test(s);  // "settings.json" yes; "Auto memory: MEMORY.md" no
+function rowEl({ label, sub = "", cls = "", tag = "", roDot = false, fold = false, icon = "", onclick, selKey, title }) {
   const b = document.createElement("button");
   b.className = "row " + cls + (sel === selKey ? " sel" : "");
   b.dataset.key = selKey;
   if (title) b.title = title;
-  b.innerHTML = (fold ? `<span class="fold-ico">▸</span>` : dot ? `<span class="dot${roDot ? " ro" : ""}"></span>` : `<span class="fold-ico">ⓘ</span>`) + `<span class="lbl">${esc(label)}</span>` + (tag ? `<span class="tag">${esc(tag)}</span>` : "");
+  const lead = icon ? `<span class="tool-ico">${esc(icon)}</span>` : fold ? `<span class="fold-ico">▸</span>` : `<span class="dot${roDot ? " ro" : ""}"></span>`;
+  const subHtml = sub && sub !== label && isFileName(sub) ? `<span class="fname">${esc(sub)}</span>` : "";
+  b.innerHTML = lead + `<span class="lbl">${esc(label)}${subHtml}</span>` + (tag ? `<span class="tag">${esc(tag)}</span>` : "");
   b.onclick = onclick;
   return b;
 }
 function fileRow(it, child = false) {
-  return rowEl({ label: it.label, cls: (it.exists ? "" : "missing ") + (child ? "child" : ""), tag: it.exists ? (it.readonly ? "read-only" : "") : (it.creatable ? "+ add" : "none"),
+  const k = tree.kinds[it.kind];
+  const label = child ? it.label : (k.short || it.label);
+  return rowEl({ label, sub: child ? "" : it.label, cls: (it.exists ? "" : "missing ") + (child ? "child" : ""), tag: it.exists ? (it.readonly ? "read-only" : "") : (it.creatable ? "+ add" : ""),
     roDot: it.readonly, onclick: () => openFile(it), selKey: "p:" + it.path, title: tilde(it.path) });
 }
-function markSel(key) { sel = key; document.querySelectorAll(".row").forEach(r => r.classList.toggle("sel", r.dataset.key === key)); }
+function markSel(key) { sel = key; document.querySelectorAll("#nav [data-key]").forEach(r => r.classList.toggle("sel", r.dataset.key === key)); }
 
 /* ---------------- Main pane ---------------- */
 function groupOf(it) { return [...tree.groups, ...tree.projects].find(g => g.id === it.group); }
@@ -3285,6 +3445,9 @@ function factsHtml(k) {
     <div class="fact"><h4>Shared or personal</h4><p>${md(k.share)}</p><p style="margin-top:6px"><a href="${esc(docUrl(k.docs))}" target="_blank" rel="noopener">Docs ↗</a></p></div>
     <div class="fact wide"><h4>Why you'd want it</h4><p>${md(k.why)}</p></div>
   </div>`;
+}
+function aboutHtml(k, open) {
+  return `<details class="about"${open ? " open" : ""}><summary>What this is for, when it loads, and why you'd want it</summary>${factsHtml(k)}</details>`;
 }
 function missingHtml(k, g, what) {
   const where = g.scope === "project" ? `<b>${esc(g.title)}</b> doesn't have ${what} yet.` : `You don't have ${what} yet.`;
@@ -3312,23 +3475,22 @@ async function openFile(it, force = false) {
   const k = tree.kinds[it.kind], g = groupOf(it);
   const c = $("#content");
   cur = null;
-  const head = `<div class="crumbs">${esc(g.title)} › ${esc(it.label)}</div><h2>${esc(k.title)}</h2>${pathLine(it.path)}${factsHtml(k)}`;
+  const head = `<div class="crumbs">${esc(g.title)} › ${esc(k.short || it.label)}</div><h2>${esc(k.title)}</h2>${pathLine(it.path)}`;
   if (!it.exists) {
     c.innerHTML = head + missingHtml(k, g, `<span class="mono">${esc(it.label)}</span>`) + `<div class="empty-card">
-      <b>This file doesn't exist yet.</b>
-      ${it.creatable ? `<p>Create it with this starting template, then edit it:</p><pre>${esc(fillTpl(k.template, g, ""))}</pre><button class="btn primary" id="create">Create ${esc(it.label)}</button>`
-        : `<p>${md(k.create_hint || (k.readonly ? (k.readonly_reason || "This file can't be created here.") : "This file is created by Claude Code itself."))}</p>`}
-    </div>`;
+      ${it.creatable ? `<p style="margin-top:0"><button class="btn primary" id="create">Create ${esc(it.label)}</button> <span class="rv-meta">It starts with this template, which you can then edit:</span></p><pre>${esc(fillTpl(k.template, g, ""))}</pre>`
+        : `<b>This file doesn't exist yet.</b><p>${md(k.create_hint || (k.readonly ? (k.readonly_reason || "This file can't be created here.") : "This file is created by Claude Code itself."))}</p>`}
+    </div>` + `<div style="margin-top:14px">${aboutHtml(k, true)}</div>`;
     wirePathButtons(c);
     const b = $("#create", c);
     if (b) b.onclick = () => doCreate(g.id, it.kind, null);
     return;
   }
   const fd = driftFor([it.path]);
-  const driftNote = fd.length ? `<div class="note">${fd.map((p, i) => `This file looks like a copy of <b class="mono">${esc(p.a === it.path ? p.b_label : p.a_label)}</b> (${Math.round(p.ratio * 100)}% the same), but they differ. <button class="mini" data-cmp="${i}">Compare</button>`).join("<br>")}</div>` : "";
+  const driftNote = fd.length ? fd.map((p, i) => `<div class="flag">Looks like a copy of <b class="mono">${esc(p.a === it.path ? p.b_label : p.a_label)}</b> (${Math.round(p.ratio * 100)}% the same) but they differ. <button class="mini" data-cmp="${i}">Compare</button></div>`).join("") : "";
   const gb = GUIDE ? GUIDE.behind.find(b => b.path === it.path) : null;
-  const guideNote = gb ? `<div class="note">Anthropic updated <b>${esc(gb.pages.join(", "))}</b> on ${esc(fmtTime(gb.latest))}, after you last edited this file (${esc(fmtTime(gb.edited))}). <button class="mini" id="gb-what">What changed</button> Then use <b>✦ Review against best practice</b> below to check it against the new version.</div>` : "";
-  c.innerHTML = head + driftNote + guideNote + `<div class="editor-wrap"><div class="toolbar"><span class="status" id="st">Loading…</span><span id="lines" style="color:var(--faint)"></span><span class="spacer"></span><button class="btn" id="hist-btn" title="Earlier versions of this file">History</button>${tree.notReviewed.includes(it.kind) ? "" : `<button class="rv-btn" id="rv-file">✦ Review against best practice</button>`}${it.readonly ? "" : `<button class="btn danger" id="del-btn" title="Move this file to DotClaude's archive">Delete</button>`}<button class="btn" id="revert" disabled>Revert</button><button class="btn primary" id="save" disabled>Save  ⌘S</button></div><div id="msgs"></div><textarea id="ed" spellcheck="false"></textarea></div>`;
+  const guideNote = gb ? `<div class="flag">Anthropic changed its guidance (${esc(gb.pages.join(", "))}) on ${esc(fmtTime(gb.latest))}, after you last edited this. <button class="mini" id="gb-what">What changed</button> Then run <b>✦ Review</b> below.</div>` : "";
+  c.innerHTML = head + driftNote + guideNote + aboutHtml(k, false) + `<div class="editor-wrap"><div class="toolbar"><span class="status" id="st">Loading…</span><span id="lines" style="color:var(--faint)"></span><span class="spacer"></span><button class="btn" id="hist-btn" title="Earlier versions of this file">History</button>${tree.notReviewed.includes(it.kind) ? "" : `<button class="rv-btn" id="rv-file" title="Check this file against Anthropic's official guidance">✦ Review</button>`}${it.readonly ? "" : `<button class="btn danger" id="del-btn" title="Move this file to DotClaude's archive">Delete</button>`}<button class="btn" id="revert" disabled>Revert</button><button class="btn primary" id="save" disabled>Save  ⌘S</button></div><div id="msgs"></div><textarea id="ed" spellcheck="false"></textarea></div>`;
   wirePathButtons(c);
   wireDrift(c, fd);
   const gw = $("#gb-what", c); if (gw) gw.onclick = () => openGuidance();
@@ -3357,12 +3519,12 @@ async function openFile(it, force = false) {
 async function deleteFile(it) {
   if (!cur || cur.item.path !== it.path) return;
   const unsaved = cur.dirty ? " Your unsaved changes will be lost." : "";
-  const a = await ask({ title: `Delete ${it.label}?`, text: `<code>${esc(tilde(it.path))}</code> moves to DotClaude's archive, so Claude Code stops reading it. You can put it back from <b>Tidy up old copies</b>.${unsaved}`, buttons: [{ label: "Cancel", value: null }, { label: "Delete", value: "go", primary: true }] });
+  const a = await ask({ title: `Delete ${it.label}?`, text: `<code>${esc(tilde(it.path))}</code> moves to DotClaude's archive, so Claude Code stops reading it. You can put it back from <b>Tidy up and deleted files</b> in the sidebar.${unsaved}`, buttons: [{ label: "Cancel", value: null }, { label: "Delete", value: "go", primary: true }] });
   if (!a || a.value !== "go") return;
   try {
     await api("POST", "/api/delete", { path: it.path, mtime: cur.mtime });
     cur.dirty = false; cur = null;
-    toast(`Deleted ${it.label}. Put it back from Tidy up old copies.`, 4000);
+    toast(`Deleted ${it.label}. Put it back from Tidy up and deleted files.`, 4000);
     await load(); welcome();
   } catch (e) { toast(e.message, 4500); }
 }
@@ -3440,7 +3602,7 @@ async function openFolder(it) {
   markSel("f:" + it.group + ":" + it.kind);
   const k = tree.kinds[it.kind], g = groupOf(it);
   const c = $("#content");
-  c.innerHTML = `<div class="crumbs">${esc(g.title)} › ${esc(it.label)}</div><h2>${esc(k.title)}</h2>${pathLine(it.path)}${factsHtml(k)}${it.children.length ? "" : missingHtml(k, g, `anything in <span class="mono">${esc(it.label)}</span>`)}
+  c.innerHTML = `<div class="crumbs">${esc(g.title)} › ${esc(k.short || it.label)}</div><h2>${esc(k.title)}</h2>${pathLine(it.path)}${it.children.length ? "" : missingHtml(k, g, `anything in <span class="mono">${esc(it.label)}</span>`)}${aboutHtml(k, !it.children.length)}
     ${it.canCreate ? `<p><button class="btn primary" id="new">+ ${esc(k.new_label || "New")}</button></p>` : (k.create_hint ? `<div class="note">${md(k.create_hint)}</div>` : "")}
     <div class="list" id="flist">${it.children.length ? "" : `<div style="padding:14px;color:var(--faint)">Nothing here yet.</div>`}</div>`;
   wirePathButtons(c);
@@ -3462,25 +3624,77 @@ async function openGroup(g) {
     desktop: "The Claude desktop app's own configuration. This is separate from Claude Code.",
     managed: "Files an IT administrator installs. They take priority over everything else.",
   }[g.scope];
+  const canHide = g.scope === "project" && g.source !== "added";
+  const sugg = suggestions(g);
+  const other = missing.filter(it => !sugg.includes(it) && it.creatable);
+  const entries = g.items.filter(it => it.type === "file" ? it.exists : it.children.length);
+  const sections = SECTION_ORDER.map(s => [s, entries.filter(it => (tree.kinds[it.kind].section || "Settings and tools") === s)]).filter(([, a]) => a.length);
   c.innerHTML = `<div class="crumbs">${esc(g.scope === "project" ? "Project" : "Section")}</div><h2>${esc(g.title)}</h2>${g.path ? pathLine(g.path) : `<div class="pathline"><code>${esc(g.subtitle)}</code></div>`}
-    <div class="note">${md(desc)}${g.note ? "<br><br>" + md(g.note) : ""}</div>
-    <div id="load-box"></div><div id="drift-g"></div>
-    ${g.source === "added" ? `<p><button class="btn" id="rm">Remove from list</button> <span style="color:var(--faint);font-size:12px">Only removes it from this app. No files are touched.</span></p>` : ""}
-    ${g.source === "claude" || g.source === "both" ? `<p style="color:var(--faint);font-size:12px">Listed because you've opened Claude Code in this folder (from ~/.claude.json).</p>` : ""}
-    ${exist.length ? `<p><button class="rv-btn" id="rv-group">✦ Review ${g.scope === "project" ? "this project" : "this section"} against best practice</button> <span style="color:var(--faint);font-size:12px">Checks all these files together against Anthropic's official pages, read fresh each time. <a href="#" id="bench-link">See the benchmark</a></span></p>` : ""}
-    <h4 style="margin:18px 0 8px">Files that exist (${exist.length})</h4><div class="list" id="ex"></div>
-    ${missing.length ? `<h4 style="margin:18px 0 8px">Files you could add (${missing.length})</h4><div class="list" id="mi"></div>` : ""}`;
+    <p class="lede">${md(desc)}</p>
+    ${g.note ? `<div class="note">${md(g.note)}</div>` : ""}
+    <div class="actions">
+      ${exist.length ? `<button class="rv-btn" id="rv-group" title="Checks all these files together against Anthropic's official pages, read fresh each time">✦ Review ${g.scope === "project" ? "this project" : "these files"} against best practice</button>` : ""}
+      ${canHide ? `<button class="btn" id="hide">Hide this project</button>` : ""}
+      ${g.source === "added" ? `<button class="btn" id="rm">Remove from list</button>` : ""}
+    </div>
+    ${sugg.length ? `<h3 class="sec">Worth adding</h3><div class="sugg">${sugg.map((it, i) => `<div class="sugg-row"><div><b>${esc(tree.kinds[it.kind].short)}</b> <span class="fname">${esc(it.label)}</span><p>${md(tree.kinds[it.kind].missing)}</p></div><button class="btn primary" data-sugg="${i}">Add it</button></div>`).join("")}</div>` : ""}
+    <div id="drift-g"></div>
+    ${sections.map(([s, arr]) => `<h3 class="sec">${esc(s)}</h3><div class="list">${arr.map(it => entryHtml(it)).join("")}</div>`).join("") || (g.missing ? "" : `<p class="lede">No Claude files here yet.</p>`)}
+    <div id="load-box"></div>
+    ${other.length ? `<details class="more"><summary>Other files you could add (${other.length})</summary><div class="list">${other.map(it => entryHtml(it, true)).join("")}</div></details>` : ""}
+    ${g.source === "claude" || g.source === "both" ? `<p class="rv-meta" style="margin-top:18px">Listed because you've opened Claude Code in this folder.</p>` : ""}`;
   if (g.path) wirePathButtons(c);
-  const fill = (id, arr) => { const l = $("#" + id, c); if (!l) return; if (!arr.length) l.innerHTML = `<div style="padding:14px;color:var(--faint)">None.</div>`;
-    arr.forEach(it => { const k = tree.kinds[it.kind]; const b = document.createElement("button"); b.innerHTML = `<span class="dot${it.exists ? (it.readonly ? " ro" : "") : ""}" style="${it.exists ? "" : "background:transparent;border:1.5px solid var(--faint)"}"></span><span style="flex:1"><span class="mono" style="font-size:13px">${esc(it.label)}</span><br><span style="font-size:12px;color:var(--muted)">${esc(k.title)}</span></span><span class="tag" style="font-size:11px;color:var(--faint)">${esc(k.loads)}</span>`; b.onclick = () => openFile(it); l.appendChild(b); }); };
-  fill("ex", exist); fill("mi", missing);
+  c.querySelectorAll("[data-entry]").forEach(b => { const it = entryByKey(g, b.dataset.entry); if (it) b.onclick = () => it.type === "folder" ? openFolder(it) : openFile(it); });
+  c.querySelectorAll("[data-sugg]").forEach(b => b.onclick = () => { const it = sugg[+b.dataset.sugg]; openFile(it); });
   if (g.scope === "global" || (g.scope === "project" && !g.missing)) renderLoad(g);
   const dp = driftFor(exist.map(i => i.path));
-  if (dp.length) { const d = $("#drift-g", c); d.innerHTML = `<h4 style="margin:18px 0 8px">Files here that have drifted apart (${dp.length})</h4>` + driftListHtml(dp); wireDrift(d, dp); }
+  if (dp.length) { const d = $("#drift-g", c); d.innerHTML = `<h3 class="sec">Drifted apart (${dp.length})</h3>` + driftListHtml(dp); wireDrift(d, dp); }
   const rvg = $("#rv-group", c); if (rvg) rvg.onclick = () => startReview({ group: g.id });
-  const bl = $("#bench-link", c); if (bl) bl.onclick = e => { e.preventDefault(); openGuidance(); };
+  const hb = $("#hide", c); if (hb) hb.onclick = () => hideProject(g);
   const rm = $("#rm", c);
-  if (rm) rm.onclick = async () => { await api("POST", "/api/folders/remove", { path: g.path }); toast("Removed from list"); await load(); welcome(); };
+  if (rm) rm.onclick = async () => { await api("POST", "/api/folders/remove", { path: g.path }); toast("Removed " + g.title + " from the list"); await load(); welcome(); };
+}
+
+const SECTION_ORDER = ["Instructions", "Settings and tools", "Skills and helpers", "Memory"];
+function entryKey(it) { return it.type === "folder" ? "f:" + it.kind : "p:" + it.path; }
+function entryByKey(g, key) { return g.items.find(it => entryKey(it) === key); }
+function entryHtml(it, missing = false) {
+  const k = tree.kinds[it.kind];
+  const n = it.type === "folder" ? it.children.length : 0;
+  const preview = n ? it.children.slice(0, 3).map(ch => ch.label.replace(/\/SKILL\.md$|\.md$/, "")).join(", ") + (n > 3 ? `, and ${n - 3} more` : "") : "";
+  const dot = missing ? `<span class="dot hollow"></span>` : it.type === "folder" ? `<span class="count">${n}</span>` : `<span class="dot${it.readonly ? " ro" : ""}"></span>`;
+  const right = missing ? `<span class="why-line">${md(k.why)}</span>` : `<span class="when">${esc(k.loads)}</span>`;
+  return `<button data-entry="${esc(entryKey(it))}">${dot}<span class="ent"><span><b>${esc(k.short || it.label)}</b> ${isFileName(it.label) ? `<span class="fname">${esc(it.label)}</span>` : ""}${it.readonly ? ` <span class="badge">read-only</span>` : ""}</span>${preview ? `<span class="preview">${esc(preview)}</span>` : ""}</span>${right}</button>`;
+}
+/* Files genuinely worth adding: an instructions file where there's none, and shared settings. */
+function suggestions(g) {
+  if (g.missing || !["project", "global"].includes(g.scope)) return [];
+  const has = kind => g.items.some(it => it.kind === kind && (it.type === "file" ? it.exists : it.children.length));
+  const find = kind => g.items.find(it => it.kind === kind && it.type === "file" && !it.exists && it.creatable);
+  const want = g.scope === "global"
+    ? [["user_claude_md", !has("user_claude_md")], ["user_settings", !has("user_settings")]]
+    : [["proj_claude_md", !has("proj_claude_md") && !has("proj_dot_claude_md") && !has("proj_agents_md")], ["proj_settings", !has("proj_settings")]];
+  return want.filter(([, w]) => w).map(([k]) => find(k)).filter(Boolean);
+}
+
+async function hideProject(g) {
+  const a = await ask({ title: `Hide ${g.title}?`, text: `It disappears from DotClaude only. No files change, and Claude Code works there as before. You can show it again from <b>Hidden projects</b> at the bottom of the project list.`, buttons: [{ label: "Cancel", value: null }, { label: "Hide", value: "go", primary: true }] });
+  if (!a || a.value !== "go") return;
+  try { await api("POST", "/api/projects/hide", { path: g.path }); toast(`Hid ${g.title}`); await load(); welcome(); }
+  catch (e) { toast(e.message, 4500); }
+}
+async function openHidden() {
+  if (!(await guardDirty())) return;
+  cur = null; markSel("hidden");
+  const c = $("#content");
+  const h = tree.hiddenProjects;
+  c.innerHTML = `<div class="crumbs">Projects</div><h2>Hidden projects</h2><p class="lede">These are left out of DotClaude's lists. Their files haven't changed, and Claude Code still uses them.</p>
+    ${h.length ? `<div class="list">${h.map((p, i) => `<div class="tidy-row"><span class="lab"><b>${esc(p.title)}</b><br><span class="rv-meta">${esc(p.subtitle)}</span></span><button class="btn" data-show="${i}">Show again</button></div>`).join("")}</div>` : `<p class="lede">Nothing is hidden.</p>`}`;
+  c.querySelectorAll("[data-show]").forEach(b => b.onclick = async () => {
+    const p = h[+b.dataset.show];
+    try { await api("POST", "/api/projects/unhide", { path: p.path }); toast(`${p.title} is back in the list`); await load(); openHidden(); }
+    catch (e) { toast(e.message, 4500); }
+  });
 }
 
 async function addFolder() {
@@ -3503,16 +3717,20 @@ async function addFolder() {
 
 function welcome() {
   if (cur && cur.dirty) return;
-  cur = null; markSel(null);
+  cur = null; markSel("home");
   let files = 0;
   [...tree.groups, ...tree.projects].forEach(g => files += countFiles(g));
+  const att = attentionItems();
+  const loading = !DRIFT || !TIDY || !GUIDE;
   $("#content").innerHTML = `<div class="welcome"><section>
     <h2>DotClaude</h2>
-    <p style="color:var(--muted)">Every file Claude Code reads on this Mac, with an explanation of what each one does. Pick a file on the left to read or edit it. A backup of the old version is saved in <code>~/.dotclaude/backups/</code> every time you save.</p>
-    <div class="stats"><div class="stat"><b>${files}</b>files found</div><div class="stat"><b>${tree.projects.length}</b>projects</div></div>
-    ${DRIFT && DRIFT.pairs.length ? `<h3 style="margin-top:22px">Files that have drifted apart (${DRIFT.pairs.length})</h3><p style="color:var(--muted)">Each pair looks like one set of instructions kept under two names, such as CLAUDE.md and AGENTS.md, but they no longer match. Claude Code and other tools may be getting different instructions.</p><div id="drift-w">${driftListHtml(DRIFT.pairs)}</div>` : ""}
-    <div class="legend"><span><span class="dot"></span> exists</span><span><span class="dot ro"></span> read-only</span><span><span class="dot" style="background:transparent;border:1.5px solid var(--faint)"></span> doesn't exist yet (you can add it)</span></div>
-    <h3 style="margin-top:26px">What Claude Code loads when a session starts</h3>
+    <p class="lede">Every file Claude Code reads on this Mac: ${files} file${files === 1 ? "" : "s"} across ${tree.projects.length} project${tree.projects.length === 1 ? "" : "s"}. Pick one on the left to read or edit it. Every save keeps a backup of the old version.</p>
+    <h3 class="sec">Needs your attention</h3>
+    ${att.length ? `<div class="list att">${att.map((a, i) => `<div class="att-row"><div class="att-text">${a.html}${a.detail ? `<details><summary>${esc(a.detailLabel)}</summary>${a.detail}</details>` : ""}</div>${a.btn ? `<button class="btn" data-att="${i}">${esc(a.btn)}</button>` : ""}</div>`).join("")}</div>`
+      : `<p class="lede">${loading ? "Checking…" : "Nothing needs your attention."}</p>`}
+    <details class="more"><summary>How Claude Code reads these files</summary>
+    <div class="legend"><span><span class="dot"></span> exists</span><span><span class="dot ro"></span> read-only</span><span><span class="dot hollow"></span> missing (shown when <b>Show missing files</b> is ticked)</span></div>
+    <h3 style="margin-top:18px">What Claude Code loads when a session starts</h3>
     <ol>
       <li><b>Organisation files</b> (if an administrator installed any)</li>
       <li><b>Your global</b> <code>~/.claude/CLAUDE.md</code> and <code>~/.claude/rules/</code></li>
@@ -3525,10 +3743,29 @@ function welcome() {
     <p>Later, when it's needed: <b>subfolder CLAUDE.md files</b>, auto-memory topic files, and the full text of skills.</p>
     <h3 style="margin-top:22px">Which settings win</h3>
     <p>Organisation → command-line flags → <code>.claude/settings.local.json</code> → <code>.claude/settings.json</code> → <code>~/.claude/settings.json</code>. Lists such as permission rules are combined across all of them.</p>
-    <p>Open any project (or <b>About this section</b> under Global) to see how much of this loads there, file by file.</p>
-    <p style="color:var(--faint);font-size:12px;margin-top:26px">Based on the Claude Code docs: <a href="https://code.claude.com/docs/en/memory.md" target="_blank" rel="noopener">Memory</a> · <a href="https://code.claude.com/docs/en/settings.md" target="_blank" rel="noopener">Settings</a> · <a href="https://code.claude.com/docs/en/claude-directory.md" target="_blank" rel="noopener">The .claude directory</a></p>
+    <p>Click any project's name on the left to see how much of this loads there, file by file.</p>
+    <p style="color:var(--faint);font-size:12px;margin-top:18px">Based on the Claude Code docs: <a href="https://code.claude.com/docs/en/memory.md" target="_blank" rel="noopener">Memory</a>, <a href="https://code.claude.com/docs/en/settings.md" target="_blank" rel="noopener">Settings</a> and <a href="https://code.claude.com/docs/en/claude-directory.md" target="_blank" rel="noopener">The .claude directory</a></p>
+    </details>
   </section></div>`;
-  if (DRIFT && DRIFT.pairs.length) wireDrift($("#content"), DRIFT.pairs);
+  const c = $("#content");
+  c.querySelectorAll("[data-att]").forEach(b => b.onclick = () => att[+b.dataset.att].go());
+  c.querySelectorAll("[data-goto]").forEach(b => b.onclick = e => { e.preventDefault(); const g = tree.projects.find(p => p.id === b.dataset.goto); if (g) openGroup(g); });
+  if (DRIFT && DRIFT.pairs.length) wireDrift(c, DRIFT.pairs);
+}
+async function goHome() { if (await guardDirty()) { if (cur) cur.dirty = false; welcome(); } }
+
+/* Everything worth a look, in one list. Each item: html, optional button + action, optional expandable detail. */
+function attentionItems() {
+  if (!tree) return [];
+  const out = [];
+  const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+  if (GUIDE && GUIDE.behind.length) out.push({ html: `<b>${plural(GUIDE.behind.length, "file was", "files were")} last edited before Anthropic changed its guidance.</b><span class="rv-meta">Worth a review against the new version.</span>`, btn: "See which", go: () => openGuidance() });
+  if (DRIFT && DRIFT.pairs.length) out.push({ html: `<b>${plural(DRIFT.pairs.length, "pair of files has", "pairs of files have")} drifted apart.</b><span class="rv-meta">Each pair looks like one set of instructions kept under two names, such as CLAUDE.md and AGENTS.md, but they no longer match, so different tools get different instructions.</span>`, detailLabel: "Show them", detail: driftListHtml(DRIFT.pairs) });
+  const bare = tree.projects.filter(g => suggestions(g).some(it => it.kind === "proj_claude_md"));
+  if (bare.length) out.push({ html: `<b>${plural(bare.length, "project has", "projects have")} no instructions file.</b><span class="rv-meta">Claude starts every session there without knowing how to build or test: ${bare.map(g => `<a href="#" data-goto="${esc(g.id)}">${esc(g.title)}</a>`).join(", ")}.</span>` });
+  if (TIDY && TIDY.strays.length) out.push({ html: `<b>${plural(TIDY.strays.length, "old copy is", "old copies are")} sitting next to Claude files.</b><span class="rv-meta">Hand-made backups like <code>settings.json.bak</code>. Claude Code ignores them.</span>`, btn: "Tidy up", go: () => openTidy() });
+  tree.projects.filter(g => g.missing).forEach(g => out.push({ html: `<b>${esc(g.title)} no longer exists.</b><span class="rv-meta">${esc(g.subtitle)} has gone, but Claude Code still lists it.</span>`, btn: g.source === "added" ? "Remove" : "Hide", go: () => g.source === "added" ? api("POST", "/api/folders/remove", { path: g.path }).then(load).then(welcome) : hideProject(g) }));
+  return out;
 }
 
 /* ---------------- What loads, drift, tidy ---------------- */
@@ -3566,7 +3803,7 @@ async function openTidy() {
   if (!(await guardDirty())) return;
   cur = null; markSel("tidy");
   const c = $("#content");
-  c.innerHTML = `<div class="crumbs">This Mac</div><h2>Tidy up old copies</h2>
+  c.innerHTML = `<div class="crumbs">Tools</div><h2>Tidy up and deleted files</h2>
     <div class="note">Copies made by hand next to a Claude file, such as <code>settings.json.bak-…</code>. Claude Code ignores them, and DotClaude already keeps a backup every time you save. Moving them to the archive gets them out of the way. Nothing is deleted, and you can put any of them back.</div><div id="tidy">Loading…</div>`;
   let t;
   try { t = await api("GET", "/api/tidy"); } catch (e) { $("#tidy").textContent = e.message; return; }
@@ -3837,11 +4074,11 @@ let DRIFT = null, TIDY = null, GUIDE = null;  // filled in the background after 
 async function load() {
   tree = await api("GET", "/api/tree"); renderNav();
   DRIFT = null; TIDY = null;
-  api("GET", "/api/guidance").then(g => { GUIDE = g; renderNav(); }).catch(() => {});
-  api("GET", "/api/drift").then(d => { DRIFT = d; onExtras(); }).catch(() => {});
-  api("GET", "/api/tidy").then(t => { TIDY = t; renderNav(); }).catch(() => {});
+  api("GET", "/api/guidance").then(g => { GUIDE = g; onExtras(); }).catch(() => { GUIDE = { behind: [] }; onExtras(); });
+  api("GET", "/api/drift").then(d => { DRIFT = d; onExtras(); }).catch(() => { DRIFT = { pairs: [] }; onExtras(); });
+  api("GET", "/api/tidy").then(t => { TIDY = t; onExtras(); }).catch(() => { TIDY = { strays: [], archived: [] }; onExtras(); });
 }
-function onExtras() { if (!cur && sel === null && $(".welcome")) welcome(); }
+function onExtras() { renderNav(); if (!cur && sel === "home" && $(".welcome")) welcome(); }
 function driftFor(paths) { return DRIFT ? DRIFT.pairs.filter(p => paths.includes(p.a) || paths.includes(p.b)) : []; }
 function driftListHtml(pairs) {
   return `<div class="list">${pairs.map((p, i) => `<div class="drift-row"><span class="files"><span class="mono">${esc(p.a_label)}</span> and <span class="mono">${esc(p.b_label)}</span><br><span class="rv-meta">${Math.round(p.ratio * 100)}% the same · ${p.changed_lines} line${p.changed_lines === 1 ? "" : "s"} differ</span></span><button class="btn" data-cmp="${i}">Compare</button></div>`).join("")}</div>`;
@@ -3861,7 +4098,7 @@ $("#stop").onclick = async () => {
   if (cur) cur.dirty = false;
   document.body.innerHTML = `<div style="margin:auto;text-align:center;color:var(--muted)"><h2 style="color:var(--ink)">DotClaude has stopped</h2><p>You can close this tab.</p></div>`;
 };
-$("#home-link").onclick = async () => { if (await guardDirty()) { if (cur) cur.dirty = false; welcome(); } };
+$("#home-link").onclick = goHome;
 document.addEventListener("keydown", e => {
   if ((e.metaKey || e.ctrlKey) && e.key === "s") { e.preventDefault(); save(); }
   if ((e.metaKey || e.ctrlKey) && e.key === "k") { e.preventDefault(); $("#search").focus(); $("#search").select(); }

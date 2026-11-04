@@ -40,7 +40,7 @@ This builds `~/Applications/DotClaude.app`. Clicking it starts DotClaude if it i
 ## What it shows
 
 - **Global**: `~/.claude/` (CLAUDE.md, settings.json, settings.local.json, keybindings.json, rules, skills, agents, commands, output styles, workflows, themes, subagent memory, hook and status line scripts), the installed plugins list (read-only) and `~/.claude.json` (read-only)
-- **Projects**: every folder you've opened Claude Code in (read from `~/.claude.json`), plus any folders you add. For each one: CLAUDE.md, .claude/CLAUDE.md, CLAUDE.local.md, AGENTS.md, settings files, .mcp.json, rules, skills, agents, commands, hook scripts, auto memory, CLAUDE.md files inherited from parent folders, and subfolder CLAUDE.md files
+- **Projects**: every folder you've opened Claude Code in (read from `~/.claude.json`), plus any folders you add. For each one: CLAUDE.md, .claude/CLAUDE.md, CLAUDE.local.md, AGENTS.md, settings files, .mcp.json, rules, skills, agents, commands, hook scripts, auto memory, CLAUDE.md files inherited from parent folders, and subfolder CLAUDE.md files. **Hide this project** on a project's page takes it out of DotClaude's lists without touching any files; **Hidden projects** at the bottom of the project list brings it back
 - **Claude desktop app**: `claude_desktop_config.json` (MCP servers for the chat app). claude.ai Projects are stored in your account, not on your Mac, so they don't appear
 - **Organisation-managed**: `/Library/Application Support/ClaudeCode/` (read-only)
 
@@ -48,9 +48,16 @@ Hook and status line scripts are the files in `.claude/hooks/` plus any script a
 
 ## Features
 
+### Finding your way around
+
+- **Home** opens with **Needs your attention**: files written before Anthropic's latest guidance, files that have drifted apart, projects with no instructions file, old copies to tidy and projects whose folder has gone. Each comes with the button that deals with it.
+- **The sidebar** names each file by what it does ("Settings (just you)"), with the file name beside it in small type. **Show missing files** also lists files you could create. Click a project's name to open its page; the arrow beside it shows or hides its files.
+- **A project's page** suggests the files actually worth adding, with the reason, then lists what's there, grouped into instructions, settings and tools, skills and helpers, and memory.
+- **A file's page** opens straight onto the editor. **What this is for, when it loads, and why you'd want it** unfolds the explanation.
+
 ### What loads at startup
 
-Open a project (or **About this section** under Global) to see what Claude Code loads at the start of every session there, file by file. It follows the rules in Anthropic's [memory docs](https://code.claude.com/docs/en/memory.md): CLAUDE.md files in the folder and every folder above it, `@imports` up to 4 hops deep, AGENTS.md only when there's no CLAUDE.md in the folder or above, rules without `paths:`, the first 200 lines of auto memory, and only the descriptions of skills and subagents. It warns about imports that point to missing files.
+Click a project's name (or **Global (all projects)**) to see what Claude Code loads at the start of every session there, file by file. It follows the rules in Anthropic's [memory docs](https://code.claude.com/docs/en/memory.md): CLAUDE.md files in the folder and every folder above it, `@imports` up to 4 hops deep, AGENTS.md only when there's no CLAUDE.md in the folder or above, rules without `paths:`, the first 200 lines of auto memory, and only the descriptions of skills and subagents. It warns about imports that point to missing files.
 
 The token count is an estimate (characters divided by 4). It leaves out Claude Code's own instructions, MCP tool lists and skills that plugins add.
 
@@ -71,12 +78,12 @@ Notes:
 
 ### The benchmark, and knowing when it changes
 
-**Best-practice benchmark** (sidebar, under Global) shows exactly what reviews judge your files against: nine official Anthropic pages (memory, best practices, skills, skill authoring, subagents, settings, permissions, hooks, MCP). A review reads the ones that apply to the files being reviewed, fresh each time, and every finding has to cite one of them.
+**Best-practice benchmark** (top of the sidebar) shows exactly what reviews judge your files against: nine official Anthropic pages (memory, best practices, skills, skill authoring, subagents, settings, permissions, hooks, MCP). A review reads the ones that apply to the files being reviewed, fresh each time, and every finding has to cite one of them.
 
 DotClaude keeps a copy of each page in `~/.dotclaude/guidance/` and compares on every check, so it can tell you:
 
 - when a page last changed, and **What changed** (a diff against the previous copy)
-- which of your files were last edited before a page that applies to them changed. Those files also show a note when you open them
+- which of your files were last edited before a page that applies to them changed. Those files also show a note when you open them. Claude's own auto memory notes are left out, since Claude writes those itself
 
 It checks when the app starts (if the last check is over 12 hours old) and when you click **Check for updates now**. It can only see changes from its first check onward.
 
@@ -89,22 +96,22 @@ python3 dotclaude.py --check-guidance --notify # same, plus a notification on ch
 
 ### Drift
 
-The home page lists instruction files that look like one file kept under two names but no longer match: CLAUDE.md beside AGENTS.md, CLAUDE.md beside .claude/CLAUDE.md, or `~/.claude/CLAUDE.md` beside `~/AGENTS.md`. **Compare** shows the differences. Similar files in different folders (one template filled in per project) aren't flagged.
+**Needs your attention** on the home page lists instruction files that look like one file kept under two names but no longer match: CLAUDE.md beside AGENTS.md, CLAUDE.md beside .claude/CLAUDE.md, or `~/.claude/CLAUDE.md` beside `~/AGENTS.md`. **Compare** shows the differences. Similar files in different folders (one template filled in per project) aren't flagged.
 
-### Tidy up old copies
+### Tidy up and deleted files
 
-**Tidy up old copies** (sidebar, under Global) lists hand-made copies sitting next to a Claude file, such as `settings.json.bak-2026…` or `CLAUDE.md.v1-backup`. Ticked files move to `~/.dotclaude/archive/`, never deleted, and **Put back** returns any of them. A copy that one of your instruction files mentions by name starts unticked, because moving it would break that reference.
+**Tidy up and deleted files** (top of the sidebar) lists hand-made copies sitting next to a Claude file, such as `settings.json.bak-2026…` or `CLAUDE.md.v1-backup`. Ticked files move to `~/.dotclaude/archive/`, never deleted, and **Put back** returns any of them. A copy that one of your instruction files mentions by name starts unticked, because moving it would break that reference.
 
 ### Deleting a file
 
-**Delete** (in each file's toolbar) moves the file to `~/.dotclaude/archive/`, so Claude Code stops reading it. Nothing is erased: the file shows up under **Tidy up old copies** marked *Deleted*, and **Put back** returns it. Read-only files have no Delete button.
+**Delete** (in each file's toolbar) moves the file to `~/.dotclaude/archive/`, so Claude Code stops reading it. Nothing is erased: the file shows up under **Tidy up and deleted files** marked *Deleted*, and **Put back** returns it. Read-only files have no Delete button.
 
 ### Backups and history
 
 Every save, applied review suggestion and restore first copies the old version to `~/.dotclaude/backups/<timestamp>/`.
 
 - **History** (in each file's toolbar): that file's earlier versions, newest first, each with the changes compared to the current file. **Restore this version** puts it back, and backs up the current version first, so a restore can be undone too.
-- **Backups** (sidebar, under Global): every saved version of every file, grouped by file. This includes files DotClaude no longer manages, which you can view and copy but not restore.
+- **Backups** (top of the sidebar): every saved version of every file, grouped by file. This includes files DotClaude no longer manages, which you can view and copy but not restore.
 
 ## Safety and privacy
 
@@ -125,7 +132,7 @@ Folders you add are stored in `~/.dotclaude/config.json`.
 python3 dotclaude.py --self-test
 ```
 
-This builds fake home folders in a temp directory and runs 164 checks (using a fake `claude` command for the review tests). They include cases that must fail: bad tokens, path traversal, invalid JSON, writes to read-only files, stale edits, a failing or missing `claude` command, rewrites aimed at files outside the review, a shutdown without the token, backup ids that try to escape the backups folder, restores onto read-only or unmanaged files, imports past 4 hops or inside code blocks, rules with `paths:`, drift between unrelated or identical files, scripts outside the home folder, saving the plugins list, archiving a live Claude file, deleting a read-only, unmanaged or changed-on-disk file, putting an archived file back over a newer one, a first guidance check reported as a change, being offline reported as a change, and macOS refusing the daily check. The last check confirms this README states the right number of checks.
+This builds fake home folders in a temp directory and runs 171 checks (using a fake `claude` command for the review tests). They include cases that must fail: bad tokens, hiding a folder that isn't a project, a hidden project's memory reported as leftover, path traversal, invalid JSON, writes to read-only files, stale edits, a failing or missing `claude` command, rewrites aimed at files outside the review, a shutdown without the token, backup ids that try to escape the backups folder, restores onto read-only or unmanaged files, imports past 4 hops or inside code blocks, rules with `paths:`, drift between unrelated or identical files, scripts outside the home folder, saving the plugins list, archiving a live Claude file, deleting a read-only, unmanaged or changed-on-disk file, putting an archived file back over a newer one, a first guidance check reported as a change, being offline reported as a change, and macOS refusing the daily check. The last check confirms this README states the right number of checks.
 
 ## Repository layout
 
