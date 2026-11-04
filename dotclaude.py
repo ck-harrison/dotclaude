@@ -1112,6 +1112,17 @@ def archive_strays(env: Env, paths: List[str]) -> dict:
     bad = [p for p in paths if p not in allowed]
     if bad:
         raise ApiError(403, "Only the old copies DotClaude lists can be archived.", {"refused": bad})
+    d = _archive_dir(env)
+    idx = _archive_index(env)
+    for p in dict.fromkeys(paths):
+        dest = d / flat_name(p)
+        shutil.move(p, str(dest))
+        idx.append({"id": f"{d.name}/{dest.name}", "original": p, "time": time.strftime("%Y-%m-%dT%H:%M:%S")})
+        atomic_write(_archive_index_path(env), json.dumps(idx, indent=2) + "\n")  # after each move, so none is lost
+    return {"ok": True, "moved": len(dict.fromkeys(paths)), "dir": tilde(env, d)}
+
+
+def _archive_dir(env: Env) -> Path:
     root = env.state_dir / "archive"
     stamp = time.strftime("%Y%m%d-%H%M%S")
     d = root / stamp
@@ -1120,13 +1131,27 @@ def archive_strays(env: Env, paths: List[str]) -> dict:
         d = root / f"{stamp}-{n}"
         n += 1
     d.mkdir(parents=True)
+    return d
+
+
+def delete_file(env: Env, path: str, mtime: Optional[str]) -> dict:
+    """Delete a managed file by moving it to the archive, so Tidy up's Put back can undo it."""
+    it = find_item(env, path)
+    if it["readonly"]:
+        raise ApiError(403, KINDS[it["kind"]].get("readonly_reason", "This file is read-only here."))
+    p = Path(path)
+    if p.is_symlink():
+        raise ApiError(403, "This file is a link to another file, so it isn't deleted here.")
+    if mtime and str(p.stat().st_mtime_ns) != mtime:
+        raise ApiError(409, "This file changed on disk since you opened it. Reload, then delete.")
+    d = _archive_dir(env)
+    dest = d / flat_name(p)
+    shutil.move(str(p), str(dest))
     idx = _archive_index(env)
-    for p in dict.fromkeys(paths):
-        dest = d / flat_name(p)
-        shutil.move(p, str(dest))
-        idx.append({"id": f"{d.name}/{dest.name}", "original": p, "time": time.strftime("%Y-%m-%dT%H:%M:%S")})
-        atomic_write(_archive_index_path(env), json.dumps(idx, indent=2) + "\n")  # after each move, so none is lost
-    return {"ok": True, "moved": len(dict.fromkeys(paths)), "dir": tilde(env, d)}
+    idx.append({"id": f"{d.name}/{dest.name}", "original": str(p), "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "deleted": True})
+    atomic_write(_archive_index_path(env), json.dumps(idx, indent=2) + "\n")
+    return {"ok": True, "id": f"{d.name}/{dest.name}", "dir": tilde(env, d)}
 
 
 def restore_archived(env: Env, aid: str) -> dict:
@@ -2042,6 +2067,7 @@ def make_handler(env: Env, token: str, port_ref: dict):
                 "/api/review/cancel": lambda: jobs.cancel(body.get("id", "")),
                 "/api/tidy/archive": lambda: archive_strays(env, body.get("paths")),
                 "/api/tidy/restore": lambda: restore_archived(env, body.get("id", "")),
+                "/api/delete": lambda: delete_file(env, body.get("path", ""), body.get("mtime")),
                 "/api/guidance/check": lambda: {**check_guidance(env), **guidance_status(env)},
                 "/api/notify": lambda: set_notify(env, bool(body.get("on"))),
                 "/api/review/apply": lambda: apply_rewrite(env, body.get("path", ""), body.get("content", ""),
@@ -2580,6 +2606,24 @@ print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "re
         except ApiError as e:
             check("tidy: bad archive id refused", e.status == 400)
 
+        live = c2 / "CLAUDE.md"
+        live_text = live.read_text()
+        for name, args, status in [("delete: read-only file refused", (pl, None), 403),
+                                   ("delete: unmanaged file refused", (str(h2 / ".bashrc"), None), 403),
+                                   ("delete: stale edit refused", (str(live), "1"), 409)]:
+            try:
+                delete_file(env2, *args)
+                check(name, False)
+            except ApiError as e:
+                check(name, e.status == status and live.is_file() and Path(pl).is_file())
+        dr = delete_file(env2, str(live), str(live.stat().st_mtime_ns))
+        a_del = next((a for a in list_tidy(env2)["archived"] if a["id"] == dr["id"]), {})
+        check("delete: file moves to the archive, marked deleted", not live.exists() and a_del.get("deleted") is True
+              and (td / "state2/archive" / dr["id"]).read_text() == live_text
+              and str(live) not in {i["path"] for i in iter_files(discover(env2)) if i["exists"]})
+        restore_archived(env2, dr["id"])
+        check("delete: put back restores it", live.read_text() == live_text)
+
         print("Best-practice benchmark tracking (fake web)")
         pages = {url: f"# {title}\n" + "guidance line\n" * 30 for title, url in GUIDANCE.values()}
         fake = lambda url: pages[url]
@@ -2646,6 +2690,10 @@ print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "re
         check("API: /api/drift works", s == 200 and "pairs" in r)
         s, r = call("POST", "/api/tidy/archive", {"paths": [str(cd / "CLAUDE.md")]})
         check("API: archiving a live file refused", s == 403 and (cd / "CLAUDE.md").is_file())
+        s, r = call("POST", "/api/delete", {"path": str(cd / "CLAUDE.md")}, tok=None)
+        check("API: delete without the token refused", s == 403 and (cd / "CLAUDE.md").is_file())
+        s, r = call("POST", "/api/delete", {"path": str(home / ".claude.json")})
+        check("API: deleting ~/.claude.json refused", s == 403 and (home / ".claude.json").is_file())
         s, r = call("GET", "/api/compare?a=" + quote(str(cd / "CLAUDE.md")) + "&b=" + quote("/etc/hosts"))
         check("API: compare with an unmanaged file refused", s == 403)
         check("API: new routes need the token", call("GET", "/api/tidy", tok=None)[0] == 403)
@@ -2809,6 +2857,7 @@ h2 { font-size: 22px; margin: 0 0 6px; letter-spacing: -.01em; }
 .btn:hover { background: var(--hover); }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
 .btn.primary:disabled { opacity: .45; cursor: default; }
+.btn.danger { color: var(--err); }
 .btn:disabled { cursor: default; }
 textarea#ed { flex: 1; border: 0; outline: none; resize: none; padding: 14px 16px; background: var(--panel); color: var(--ink); font-size: 13px; line-height: 1.55; tab-size: 2; }
 textarea#ed[readonly] { color: var(--muted); }
@@ -3073,7 +3122,7 @@ async function openFile(it, force = false) {
   const driftNote = fd.length ? `<div class="note">${fd.map((p, i) => `This file looks like a copy of <b class="mono">${esc(p.a === it.path ? p.b_label : p.a_label)}</b> (${Math.round(p.ratio * 100)}% the same), but they differ. <button class="mini" data-cmp="${i}">Compare</button>`).join("<br>")}</div>` : "";
   const gb = GUIDE ? GUIDE.behind.find(b => b.path === it.path) : null;
   const guideNote = gb ? `<div class="note">Anthropic updated <b>${esc(gb.pages.join(", "))}</b> on ${esc(fmtTime(gb.latest))}, after you last edited this file (${esc(fmtTime(gb.edited))}). <button class="mini" id="gb-what">What changed</button> Then use <b>✦ Review against best practice</b> below to check it against the new version.</div>` : "";
-  c.innerHTML = head + driftNote + guideNote + `<div class="editor-wrap"><div class="toolbar"><span class="status" id="st">Loading…</span><span id="lines" style="color:var(--faint)"></span><span class="spacer"></span><button class="btn" id="hist-btn" title="Earlier versions of this file">History</button>${tree.notReviewed.includes(it.kind) ? "" : `<button class="rv-btn" id="rv-file">✦ Review against best practice</button>`}<button class="btn" id="revert" disabled>Revert</button><button class="btn primary" id="save" disabled>Save  ⌘S</button></div><div id="msgs"></div><textarea id="ed" spellcheck="false"></textarea></div>`;
+  c.innerHTML = head + driftNote + guideNote + `<div class="editor-wrap"><div class="toolbar"><span class="status" id="st">Loading…</span><span id="lines" style="color:var(--faint)"></span><span class="spacer"></span><button class="btn" id="hist-btn" title="Earlier versions of this file">History</button>${tree.notReviewed.includes(it.kind) ? "" : `<button class="rv-btn" id="rv-file">✦ Review against best practice</button>`}${it.readonly ? "" : `<button class="btn danger" id="del-btn" title="Move this file to DotClaude's archive">Delete</button>`}<button class="btn" id="revert" disabled>Revert</button><button class="btn primary" id="save" disabled>Save  ⌘S</button></div><div id="msgs"></div><textarea id="ed" spellcheck="false"></textarea></div>`;
   wirePathButtons(c);
   wireDrift(c, fd);
   const gw = $("#gb-what", c); if (gw) gw.onclick = () => openGuidance();
@@ -3091,11 +3140,25 @@ async function openFile(it, force = false) {
   $("#save").onclick = () => save();
   const rvb = $("#rv-file"); if (rvb) rvb.onclick = () => startReview({ path: it.path });
   $("#hist-btn").onclick = () => openHistory(it);
+  const db = $("#del-btn"); if (db) db.onclick = () => deleteFile(it);
   api("GET", "/api/backups?path=" + encodeURIComponent(it.path)).then(b => {
     const hb = $("#hist-btn"); if (hb && cur && cur.item.path === it.path) hb.textContent = `History (${b.count})`;
   }).catch(() => {});
   $("#revert").onclick = () => { ed.value = cur.original; cur.dirty = false; updateBar(); };
   updateBar();
+}
+
+async function deleteFile(it) {
+  if (!cur || cur.item.path !== it.path) return;
+  const unsaved = cur.dirty ? " Your unsaved changes will be lost." : "";
+  const a = await ask({ title: `Delete ${it.label}?`, text: `<code>${esc(tilde(it.path))}</code> moves to DotClaude's archive, so Claude Code stops reading it. You can put it back from <b>Tidy up old copies</b>.${unsaved}`, buttons: [{ label: "Cancel", value: null }, { label: "Delete", value: "go", primary: true }] });
+  if (!a || a.value !== "go") return;
+  try {
+    await api("POST", "/api/delete", { path: it.path, mtime: cur.mtime });
+    cur.dirty = false; cur = null;
+    toast(`Deleted ${it.label}. Put it back from Tidy up old copies.`, 4000);
+    await load(); welcome();
+  } catch (e) { toast(e.message, 4500); }
 }
 
 function updateBar() {
@@ -3124,6 +3187,7 @@ async function save(force = false) {
   try {
     const r = await api("POST", "/api/save", { path: cur.item.path, content: ed.value, mtime: cur.mtime, force });
     cur.original = ed.value; cur.mtime = r.mtime; cur.dirty = false; updateBar();
+    if (cur.fromRewrite) { RV_STATE[cur.fromRewrite] = "edited"; cur.fromRewrite = null; }
     toast("Saved. Old version backed up in ~/.dotclaude/backups/", 3000);
     return true;
   } catch (e) {
@@ -3303,7 +3367,7 @@ async function openTidy() {
   const box = $("#tidy");
   box.innerHTML = (t.strays.length ? `<div class="list">${t.strays.map((s, i) => `<label class="tidy-row"><input type="checkbox" data-i="${i}" ${s.referenced_in.length ? "" : "checked"}><span class="lab"><span class="mono">${esc(s.label)}</span><br><span class="rv-meta">Copy of ${esc(s.of)} · ${fmtSize(s.size)} · ${esc(fmtTime(s.mtime))}</span>${s.referenced_in.length ? `<br><span style="color:var(--warn);font-size:12px">Mentioned by name in ${esc(s.referenced_in.join(", "))}. Moving it would break that reference, so it isn't ticked.</span>` : ""}</span></label>`).join("")}</div>
       <p style="margin-top:10px"><button class="btn primary" id="arch">Move ticked files to the archive</button> <span class="rv-meta">They go to <code>${esc(t.dir)}</code>.</span></p>` : `<div class="note">No old copies found.</div>`)
-    + (t.archived.length ? `<h4 style="margin:22px 0 8px">In the archive (${t.archived.length})</h4><div class="list">${t.archived.map((a, i) => `<div class="tidy-row"><span class="lab"><span class="mono">${esc(a.label)}</span><br><span class="rv-meta">Archived ${esc(fmtTime(a.time))}</span></span><button class="btn" data-put="${i}">Put back</button></div>`).join("")}</div>` : "");
+    + (t.archived.length ? `<h4 style="margin:22px 0 8px">In the archive (${t.archived.length})</h4><div class="list">${t.archived.map((a, i) => `<div class="tidy-row"><span class="lab"><span class="mono">${esc(a.label)}</span><br><span class="rv-meta">${a.deleted ? "Deleted" : "Archived"} ${esc(fmtTime(a.time))}</span></span><button class="btn" data-put="${i}">Put back</button></div>`).join("")}</div>` : "");
   const arch = $("#arch", box);
   if (arch) arch.onclick = async () => {
     const paths = [...box.querySelectorAll("input[data-i]:checked")].map(x => t.strays[+x.dataset.i].path);
@@ -3526,6 +3590,7 @@ function renderReview() {
       h += `<div class="rv-card"><h4><span class="rv-file" data-open="${esc(w.file)}">${esc(fileLabel(w.file))}</span></h4><p>${md(w.explanation)}</p>
         <details><summary style="cursor:pointer;font-size:13px">Show changes</summary><pre class="diff">${diffHtml(w.diff)}</pre></details>
         <p style="margin-top:10px">${st === "applied" ? `<span style="color:var(--ok);font-weight:600">✓ Applied. The old version is in ~/.dotclaude/backups/</span>` :
+          st === "edited" ? `<span style="color:var(--ok);font-weight:600">✓ Saved with your edits. The old version is in ~/.dotclaude/backups/</span> <button class="btn" data-open="${esc(w.file)}">Open the saved file</button>` :
           `<button class="btn primary" data-apply="${i}">Apply (backs up current file)</button> <button class="btn" data-tweak="${i}">Open in editor to adjust first</button>`}</p></div>`;
     });
   }
@@ -3558,7 +3623,7 @@ async function tweakRewrite(i) {
   const it = findItem(w.file); if (!it) return;
   await openFile(it);
   if (!cur || cur.item.path !== w.file) return;
-  $("#ed").value = w.content; cur.dirty = w.content !== cur.original; updateBar();
+  $("#ed").value = w.content; cur.dirty = w.content !== cur.original; cur.fromRewrite = RV.id + ":" + i; updateBar();
   $("#msgs").insertAdjacentHTML("afterbegin", `<div class="msg warn">The suggested rewrite is loaded but not saved yet. Edit it if you want, then Save (the current version gets backed up first), or Revert to throw it away.</div>`);
 }
 

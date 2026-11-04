@@ -95,6 +95,10 @@ The home page lists instruction files that look like one file kept under two nam
 
 **Tidy up old copies** (sidebar, under Global) lists hand-made copies sitting next to a Claude file, such as `settings.json.bak-2026…` or `CLAUDE.md.v1-backup`. Ticked files move to `~/.dotclaude/archive/`, never deleted, and **Put back** returns any of them. A copy that one of your instruction files mentions by name starts unticked, because moving it would break that reference.
 
+### Deleting a file
+
+**Delete** (in each file's toolbar) moves the file to `~/.dotclaude/archive/`, so Claude Code stops reading it. Nothing is erased: the file shows up under **Tidy up old copies** marked *Deleted*, and **Put back** returns it. Read-only files have no Delete button.
+
 ### Backups and history
 
 Every save, applied review suggestion and restore first copies the old version to `~/.dotclaude/backups/<timestamp>/`.
@@ -121,7 +125,7 @@ Folders you add are stored in `~/.dotclaude/config.json`.
 python3 dotclaude.py --self-test
 ```
 
-This builds fake home folders in a temp directory and runs 155 checks (using a fake `claude` command for the review tests). They include cases that must fail: bad tokens, path traversal, invalid JSON, writes to read-only files, stale edits, a failing or missing `claude` command, rewrites aimed at files outside the review, a shutdown without the token, backup ids that try to escape the backups folder, restores onto read-only or unmanaged files, imports past 4 hops or inside code blocks, rules with `paths:`, drift between unrelated or identical files, scripts outside the home folder, saving the plugins list, archiving a live Claude file, putting an archived file back over a newer one, a first guidance check reported as a change, being offline reported as a change, and macOS refusing the daily check. The last check confirms this README states the right number of checks.
+This builds fake home folders in a temp directory and runs 162 checks (using a fake `claude` command for the review tests). They include cases that must fail: bad tokens, path traversal, invalid JSON, writes to read-only files, stale edits, a failing or missing `claude` command, rewrites aimed at files outside the review, a shutdown without the token, backup ids that try to escape the backups folder, restores onto read-only or unmanaged files, imports past 4 hops or inside code blocks, rules with `paths:`, drift between unrelated or identical files, scripts outside the home folder, saving the plugins list, archiving a live Claude file, deleting a read-only, unmanaged or changed-on-disk file, putting an archived file back over a newer one, a first guidance check reported as a change, being offline reported as a change, and macOS refusing the daily check. The last check confirms this README states the right number of checks.
 
 ## Repository layout
 
