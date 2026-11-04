@@ -280,6 +280,192 @@ KINDS: Dict[str, dict] = {
         docs="memory.md"),
 }
 
+# Why you'd want each file ("why", shown on every page) and what you lose without it ("missing",
+# shown when the file doesn't exist or the folder is empty). Public UI copy: no em-dashes.
+KIND_WHY: Dict[str, tuple] = {
+    "user_claude_md": (
+        "It saves you repeating yourself. Anything you'd otherwise tell Claude at the start of every session "
+        "(how you like answers, tools you use, things to never do) goes here once.",
+        "Every session starts knowing nothing about you, so you correct the same habits again and again. "
+        "Add a short list of the preferences you find yourself repeating."),
+    "user_settings": (
+        "Fewer permission prompts and consistent behaviour everywhere. Allow the safe commands you always "
+        "approve, block the risky ones, and set hooks or a default model once for every project.",
+        "Claude asks permission for the same safe commands in every project, and there's nowhere to set "
+        "hooks or defaults that apply everywhere. Add one when the prompts start to feel repetitive."),
+    "keybindings": (
+        "Only useful if Claude Code's default shortcuts clash with your terminal or your muscle memory.",
+        "Nothing is lost: the default shortcuts apply. Create it only if a shortcut gets in your way."),
+    "user_rules": (
+        "Keeps your personal CLAUDE.md short. Topic files are easier to maintain, and a rule with `paths:` "
+        "only loads for matching files, so it costs nothing in sessions that don't need it.",
+        "Everything personal has to live in one CLAUDE.md, which gets long and is followed less reliably. "
+        "Move a topic here when CLAUDE.md grows past a screen or two, or when advice only applies to one "
+        "kind of file."),
+    "user_skills": (
+        "Turns a procedure you repeat into something Claude does the same way every time, in any project. "
+        "Only the short description loads until it's needed, so a skill costs almost no context.",
+        "Repeated procedures (a review checklist, a release routine) have to be explained from scratch each "
+        "time. Write a skill the second time you explain the same steps."),
+    "user_agents": (
+        "Hands focused jobs (code review, research, testing) to a helper with its own instructions and a "
+        "clean context, so your main conversation stays short and on topic.",
+        "Every task runs in your main conversation and fills it up. Add a subagent for a job you hand off "
+        "often and want done the same way each time."),
+    "user_commands": (
+        "Only worth keeping if you already have commands that work. Skills do the same job and more.",
+        "Nothing is lost. Write a skill instead: it does everything a command does and can also be used "
+        "automatically."),
+    "user_output_styles": (
+        "Changes Claude's whole manner for a kind of work, such as a teaching style or a terse reviewer, "
+        "without rewriting your instructions.",
+        "You get Claude Code's default style, which suits most coding. Add one only if you want a "
+        "different voice or role across sessions."),
+    "user_workflows": (
+        "Saves a multi-agent job you run often so you can start it by name instead of describing it again.",
+        "Nothing is lost until you run the same multi-agent job twice. Save it here when you do."),
+    "user_themes": (
+        "Purely visual: makes Claude Code's terminal match your colour scheme.",
+        "Nothing is lost: the built-in themes apply."),
+    "user_agent_memory": (
+        "Lets a subagent remember what it learned across projects, so it improves over time instead of "
+        "starting fresh.",
+        "Your subagents forget everything between sessions. This fills in automatically once a subagent "
+        "has `memory: user` set."),
+    "user_settings_local": (
+        "Only matters if you start Claude Code in your home folder itself, rather than in a project.",
+        "Nothing is lost for normal project work. Claude Code creates it if you approve something "
+        "permanently while working in your home folder."),
+    "user_plugins": (
+        "Shows what plugins are adding to every session, which matters because each one can add skills, "
+        "hooks and tools you didn't write.",
+        "No plugins are installed, so nothing extra is loading into your sessions."),
+    "user_scripts": (
+        "Hooks are the only way to make something happen every time, guaranteed: block dangerous commands, "
+        "run checks after edits, log activity. Instructions in CLAUDE.md are advice; hooks are enforced.",
+        "Everything relies on Claude following instructions. Add a hook for any rule that must never be "
+        "broken, such as blocking deletes outside the project."),
+    "proj_scripts": (
+        "Enforces this project's rules automatically, such as running the formatter after every edit or "
+        "blocking writes to production config.",
+        "This project's rules are advice only. Add a hook script when one of them must always happen, "
+        "such as formatting or tests after edits."),
+    "claude_json": (
+        "Claude Code needs it to run. It's useful here to see which projects and MCP servers it knows about.",
+        "Claude Code creates this itself the first time it runs."),
+    "automem_orphan": (
+        "Usually leftovers. Worth a look: notes from a moved project may still be useful, and notes from a "
+        "deleted one can go.",
+        "No leftover memory folders. Nothing to tidy."),
+    "managed_claude_md": (
+        "Lets an organisation give every user the same baseline instructions that can't be switched off.",
+        "Normal on a personal Mac. Only an IT administrator would install this."),
+    "managed_settings": (
+        "Lets an organisation enforce security settings that no user or project can loosen.",
+        "Normal on a personal Mac. Only an IT administrator would install this."),
+    "managed_mcp": (
+        "Lets an organisation control which external tools everyone can connect.",
+        "Normal on a personal Mac. Only an IT administrator would install this."),
+    "desktop_config": (
+        "Gives the Claude desktop app's chat access to local tools, such as your files or a database, "
+        "through MCP servers.",
+        "The desktop chat can only use built-in features and connectors from your claude.ai account. Add "
+        "this when you want it to reach something on your Mac."),
+    "desktop_app_config": (
+        "The desktop app manages this itself. It's shown so you know it exists.",
+        "The desktop app creates this itself."),
+    "proj_claude_md": (
+        "The single most useful file for a project. It tells every session how to build, test and work in "
+        "this codebase, so Claude stops guessing commands and breaking conventions.",
+        "Every session in this project starts blind: Claude has to rediscover how to build and test, and "
+        "guesses at your conventions. Add one with the build and test commands and the few rules that "
+        "matter most. Running /init in Claude Code drafts one from the code."),
+    "proj_dot_claude_md": (
+        "Same benefit as a root CLAUDE.md, with a tidier project root.",
+        "Nothing is lost if the project has a CLAUDE.md in its root. Use one location or the other, not "
+        "both."),
+    "proj_local_md": (
+        "Keeps your personal details for this project (local URLs, test logins, how you like to work on it) "
+        "out of the shared CLAUDE.md and out of git.",
+        "Personal notes either go in the shared CLAUDE.md, where teammates see them, or nowhere. Add one if "
+        "you have project details that are only true on your machine."),
+    "proj_agents_md": (
+        "Useful when other AI tools (Codex, Cursor and others) work on this project too: one instructions "
+        "file they all read.",
+        "Nothing is lost if only Claude Code works on this project. If other tools do, keep instructions in "
+        "AGENTS.md and make CLAUDE.md a single line, `@AGENTS.md`, so both stay in step."),
+    "proj_settings": (
+        "Gives everyone on the project the same permissions and hooks, so safe project commands (build, "
+        "test, lint) run without prompts and risky ones stay blocked.",
+        "Claude asks permission for this project's routine commands every time, and nothing project-wide is "
+        "enforced. Add one to allow the build and test commands and to hold any project hooks."),
+    "proj_settings_local": (
+        "Holds your own permission approvals for this project without affecting anyone else.",
+        "Nothing is lost. Claude Code creates it the first time you answer \"Yes, and don't ask again\"."),
+    "proj_mcp": (
+        "Connects this project to the external tools it needs (a database, an issue tracker, a browser), "
+        "and shares that setup with everyone who works on it.",
+        "Claude can only use tools you've connected personally. Add one when this project depends on an "
+        "external service Claude should be able to query."),
+    "proj_worktreeinclude": (
+        "Makes parallel worktree sessions work straight away, by copying the git-ignored files (like .env) "
+        "they need to run.",
+        "New worktrees start without your .env and other ignored files, so builds or tests may fail there. "
+        "Add one if you use worktrees and the project needs such files."),
+    "proj_rules": (
+        "Keeps the project CLAUDE.md short and lets advice for one area (tests, the API, the frontend) load "
+        "only when Claude works on those files.",
+        "All project guidance sits in CLAUDE.md and loads every session, relevant or not. Add rules when "
+        "CLAUDE.md grows long or has sections that only apply to certain files."),
+    "proj_skills": (
+        "Packages this project's repeat procedures (deploy, release, data refresh) so Claude follows them "
+        "exactly, and anyone with the project gets them too.",
+        "Project procedures have to be explained each time or crammed into CLAUDE.md. Add a skill for any "
+        "multi-step routine you run more than once here."),
+    "proj_agents": (
+        "Gives this project specialist helpers that know its codebase, such as a reviewer that checks "
+        "your conventions, each with its own clean context.",
+        "Specialist jobs run in your main conversation. Add a subagent for a review or check you want done "
+        "the same way every time in this project."),
+    "proj_commands": (
+        "Only worth keeping if this project already has commands that work. Skills do the same job and more.",
+        "Nothing is lost. Write a project skill instead."),
+    "proj_output_styles": (
+        "Sets a manner that suits this project, such as explanatory for a teaching repo.",
+        "You get the default style, which suits most projects. Add one only if this project needs a "
+        "different voice."),
+    "proj_workflows": (
+        "Saves a multi-agent job this project runs often so anyone can start it by name.",
+        "Nothing is lost until you run the same multi-agent job here twice."),
+    "proj_agent_memory": (
+        "Lets a subagent build up knowledge of this project and share it with everyone who has the project.",
+        "Subagents forget this project between sessions. This fills in automatically once a subagent has "
+        "`memory: project` set."),
+    "proj_agent_memory_local": (
+        "Lets a subagent remember this project privately, for you only.",
+        "Subagents forget this project between sessions. This fills in automatically once a subagent has "
+        "`memory: local` set."),
+    "automem_index": (
+        "Claude keeps what it learns about this project (commands that work, mistakes to avoid, your "
+        "corrections) and reads it back next session, so it doesn't repeat mistakes.",
+        "Claude hasn't saved anything about this project yet, so lessons from past sessions are lost. It "
+        "fills in by itself as you work; you can also ask Claude to \"remember\" something."),
+    "automem_topics": (
+        "Holds the detail behind MEMORY.md, loaded only when relevant, so memory can grow without filling "
+        "the context at startup.",
+        "Nothing is lost while MEMORY.md is short. Claude creates topic files as its notes grow."),
+    "parent_md": (
+        "Shares instructions across every project under one folder, such as all your work repos, without "
+        "copying them into each one.",
+        "Nothing is inherited, so shared conventions have to be repeated in each project. Add a CLAUDE.md "
+        "to a parent folder if several projects there follow the same rules."),
+    "sub_md": (
+        "Gives instructions for one part of the codebase only when Claude works there, keeping startup "
+        "context small.",
+        "All guidance loads at startup. Add one in a subfolder whose rules differ from the rest of the "
+        "project, such as a frontend or a legacy module."),
+}
+
 # Project folder kinds reuse the personal wording, adjusted for "shared".
 for _p, _u in [("proj_rules", "user_rules"), ("proj_skills", "user_skills"), ("proj_agents", "user_agents"),
                ("proj_commands", "user_commands"), ("proj_output_styles", "user_output_styles"),
@@ -290,6 +476,9 @@ for _p, _u in [("proj_rules", "user_rules"), ("proj_skills", "user_skills"), ("p
     _k["share"] = "Shared (commit to git)"
     _k["role"] = _k["role"] + " These ones only apply in this project and are shared with anyone who has it."
     KINDS[_p] = _k
+
+for _w, (_why, _missing) in KIND_WHY.items():
+    KINDS[_w]["why"], KINDS[_w]["missing"] = _why, _missing
 
 # File specs: (kind, path relative to scope root, show when missing)
 GLOBAL_FILES = [("user_claude_md", "CLAUDE.md", True), ("user_settings", "settings.json", True),
@@ -2122,6 +2311,13 @@ def self_test() -> int:
         results.append((name, bool(cond)))
         print(("  PASS  " if cond else "  FAIL  ") + name)
 
+    print("File type descriptions")
+    no_why = [k for k, v in KINDS.items() if not (v.get("why") or "").strip() or not (v.get("missing") or "").strip()]
+    check(f"every file type says why you'd want it and what's lost without it (missing: {no_why})", not no_why)
+    dashed = [k for k, v in KINDS.items() if any("—" in str(v.get(f, "")) for f in
+                                                  ("role", "why", "missing", "loads", "share", "create_hint"))]
+    check(f"no em-dashes in file type descriptions (found in: {dashed})", not dashed)
+
     with tempfile.TemporaryDirectory() as td:
         td = Path(td).resolve()
         home = td / "home"
@@ -2844,6 +3040,11 @@ h2 { font-size: 22px; margin: 0 0 6px; letter-spacing: -.01em; }
 .pathline code { background: var(--code); border: 1px solid var(--line); padding: 2px 8px; border-radius: 6px; font-size: 12px; word-break: break-all; }
 .facts { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 10px; margin-bottom: 18px; }
 .fact { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+.fact.wide { grid-column: 1 / -1; }
+.why-missing { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 10px; padding: 12px 14px; margin: 0 0 14px; }
+.why-missing h4 { margin: 0 0 4px; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--faint); font-weight: 600; }
+.why-missing p { margin: 0; font-size: 14px; }
+.why-missing code { background: var(--code); padding: 0 4px; border-radius: 4px; font-size: 12px; }
 .fact h4 { margin: 0 0 3px; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--faint); font-weight: 600; }
 .fact p { margin: 0; font-size: 13px; }
 .fact code { background: var(--code); padding: 0 4px; border-radius: 4px; font-size: 12px; }
@@ -3082,7 +3283,12 @@ function factsHtml(k) {
     <div class="fact"><h4>What it's for</h4><p>${md(k.role)}</p></div>
     <div class="fact"><h4>When it loads</h4><p>${md(k.loads)}</p></div>
     <div class="fact"><h4>Shared or personal</h4><p>${md(k.share)}</p><p style="margin-top:6px"><a href="${esc(docUrl(k.docs))}" target="_blank" rel="noopener">Docs ↗</a></p></div>
+    <div class="fact wide"><h4>Why you'd want it</h4><p>${md(k.why)}</p></div>
   </div>`;
+}
+function missingHtml(k, g, what) {
+  const where = g.scope === "project" ? `<b>${esc(g.title)}</b> doesn't have ${what} yet.` : `You don't have ${what} yet.`;
+  return `<div class="why-missing"><h4>Why it could help</h4><p>${where} ${md(k.missing)}</p></div>`;
 }
 function pathLine(path) {
   return `<div class="pathline"><code>${esc(tilde(path))}</code><button class="mini" data-copy="${esc(path)}">Copy path</button><button class="mini" data-reveal="${esc(path)}">Show in Finder</button></div>`;
@@ -3108,7 +3314,7 @@ async function openFile(it, force = false) {
   cur = null;
   const head = `<div class="crumbs">${esc(g.title)} › ${esc(it.label)}</div><h2>${esc(k.title)}</h2>${pathLine(it.path)}${factsHtml(k)}`;
   if (!it.exists) {
-    c.innerHTML = head + `<div class="empty-card">
+    c.innerHTML = head + missingHtml(k, g, `<span class="mono">${esc(it.label)}</span>`) + `<div class="empty-card">
       <b>This file doesn't exist yet.</b>
       ${it.creatable ? `<p>Create it with this starting template, then edit it:</p><pre>${esc(fillTpl(k.template, g, ""))}</pre><button class="btn primary" id="create">Create ${esc(it.label)}</button>`
         : `<p>${md(k.create_hint || (k.readonly ? (k.readonly_reason || "This file can't be created here.") : "This file is created by Claude Code itself."))}</p>`}
@@ -3234,7 +3440,7 @@ async function openFolder(it) {
   markSel("f:" + it.group + ":" + it.kind);
   const k = tree.kinds[it.kind], g = groupOf(it);
   const c = $("#content");
-  c.innerHTML = `<div class="crumbs">${esc(g.title)} › ${esc(it.label)}</div><h2>${esc(k.title)}</h2>${pathLine(it.path)}${factsHtml(k)}
+  c.innerHTML = `<div class="crumbs">${esc(g.title)} › ${esc(it.label)}</div><h2>${esc(k.title)}</h2>${pathLine(it.path)}${factsHtml(k)}${it.children.length ? "" : missingHtml(k, g, `anything in <span class="mono">${esc(it.label)}</span>`)}
     ${it.canCreate ? `<p><button class="btn primary" id="new">+ ${esc(k.new_label || "New")}</button></p>` : (k.create_hint ? `<div class="note">${md(k.create_hint)}</div>` : "")}
     <div class="list" id="flist">${it.children.length ? "" : `<div style="padding:14px;color:var(--faint)">Nothing here yet.</div>`}</div>`;
   wirePathButtons(c);
