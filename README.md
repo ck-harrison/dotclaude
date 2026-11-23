@@ -4,7 +4,7 @@
 
 Claude Code's behaviour is shaped by a scatter of files: `CLAUDE.md` in several places, settings at three levels, rules, skills, subagents, hooks, MCP config, auto memory. DotClaude finds them all, explains what each one does and when it loads, shows how much context a session starts with, and reviews your files against Anthropic's official guidance.
 
-![DotClaude showing what loads at the start of a session in a project](docs/screenshot.png)
+![DotClaude showing a project: a file worth adding, two files that have drifted apart, and the project's files grouped by what they do](docs/screenshot.png)
 
 - **One place for everything.** Your global `~/.claude/` files and every project you've opened Claude Code in, each file labelled with what it does, when it loads and whether it's shared or personal.
 - **What loads at startup.** For each project, the files Claude Code reads before you type anything, with a size estimate.
@@ -34,6 +34,8 @@ bash make-dock-app.sh --add-to-dock
 ```
 
 This builds `~/Applications/DotClaude.app`. Clicking it starts DotClaude if it isn't running and opens it in your browser, reusing a running copy rather than starting a second one. Stop it with **Stop** in the sidebar. Launcher log: `~/Library/Logs/DotClaude/launcher.log`.
+
+**Updating:** after a `git pull`, a running copy keeps the old version. The sidebar then says **DotClaude has been updated**; **Restart now** restarts it on the same address and reloads the page. It checks when the page opens and when you come back to its tab.
 
 **Options:** `--port N` to pick a port, `--no-browser` to skip opening a tab, `--self-test` to run the built-in checks.
 
@@ -71,7 +73,7 @@ Click **Review against best practice** on any file, or on a project's page to re
 Notes:
 
 - It needs the `claude` command to work in Terminal. If you start the app some other way, set `DOTCLAUDE_CLAUDE_BIN=/path/to/claude`
-- It uses your Claude plan's usage. A project review took about 45 seconds in testing
+- It uses your Claude plan's usage. A 3-file project review took about 3 minutes in testing. It loads none of your MCP servers, since their tool lists cost far more than the review needs
 - Values in JSON files that look like keys or tokens (and everything under `env`) are replaced with `<redacted>` before anything is sent. Those files get findings but no rewrites
 - If an official page couldn't be loaded, the results say so
 - Reports are saved in `~/.dotclaude/reviews/`
@@ -83,7 +85,10 @@ Notes:
 DotClaude keeps a copy of each page in `~/.dotclaude/guidance/` and compares on every check, so it can tell you:
 
 - when a page last changed, and **What changed** (a diff against the previous copy)
-- which of your files were last edited before a page that applies to them changed. Those files also show a note when you open them. Claude's own auto memory notes are left out, since Claude writes those itself
+- which of your files were last edited before a page about that kind of file changed. A change to the memory or best-practices page flags instruction files (CLAUDE.md, AGENTS.md, rules); skills, settings, subagents and MCP files are flagged only when their own page changes. Those files also show a note when you open them. Memory that Claude or a subagent writes itself is left out
+- the changes themselves, word by word, on the home page, with how big each one was in lines. If none of it affects you, **Mark as reviewed** clears the list until a page changes again. Editing or reviewing a file also takes it off the list
+
+**Write-ups.** When a page changes, DotClaude asks Claude to write it up: what the page said before, what it says now, why it matters, and what to do differently, plus a short list of how to adapt your approach overall. The headline shows on the home page; **Read the write-up** opens the full version, and every write-up stays on the benchmark page. It runs once per change, right after the check that found it (when the app starts, when you click **Check for updates now**, or in the daily check before the notification). It uses your `claude` command with no tools, sends only the public page changes (none of your files), and uses a little of your Claude plan's usage. If it fails, it isn't retried automatically; **Try again** retries it. Write-ups are saved in `~/.dotclaude/guidance/writeups/`.
 
 It checks when the app starts (if the last check is over 12 hours old) and when you click **Check for updates now**. It can only see changes from its first check onward.
 
@@ -120,7 +125,7 @@ Every save, applied review suggestion and restore first copies the old version t
 - JSON files aren't saved if they're invalid
 - If Claude Code changed a file while you had it open, the app asks before overwriting it
 - `~/.claude.json`, managed files and the desktop app's config are read-only
-- Nothing leaves your Mac except the best-practice review (through your own `claude` command, with secrets redacted) and fetches of Anthropic's public docs pages
+- Nothing leaves your Mac except the best-practice review (through your own `claude` command, with secrets redacted), write-ups of guidance changes (only the public page changes, through the same command) and fetches of Anthropic's public docs pages
 
 Folders you add are stored in `~/.dotclaude/config.json`.
 
@@ -132,7 +137,7 @@ Folders you add are stored in `~/.dotclaude/config.json`.
 python3 dotclaude.py --self-test
 ```
 
-This builds fake home folders in a temp directory and runs 171 checks (using a fake `claude` command for the review tests). They include cases that must fail: bad tokens, hiding a folder that isn't a project, a hidden project's memory reported as leftover, path traversal, invalid JSON, writes to read-only files, stale edits, a failing or missing `claude` command, rewrites aimed at files outside the review, a shutdown without the token, backup ids that try to escape the backups folder, restores onto read-only or unmanaged files, imports past 4 hops or inside code blocks, rules with `paths:`, drift between unrelated or identical files, scripts outside the home folder, saving the plugins list, archiving a live Claude file, deleting a read-only, unmanaged or changed-on-disk file, putting an archived file back over a newer one, a first guidance check reported as a change, being offline reported as a change, and macOS refusing the daily check. The last check confirms this README states the right number of checks.
+This builds fake home folders in a temp directory and runs 193 checks (using a fake `claude` command for the review and write-up tests). They include cases that must fail: bad tokens, a restart without the token, an updated script not flagged, a review or write-up that loads your MCP servers, a guidance change marked as reviewed coming back after a newer change, a skill flagged by a change to the CLAUDE.md page, a write-up that sends your files or retries a failure on its own, hiding a folder that isn't a project, a hidden project's memory reported as leftover, path traversal, invalid JSON, writes to read-only files, stale edits, a failing or missing `claude` command, rewrites aimed at files outside the review, a shutdown without the token, backup ids that try to escape the backups folder, restores onto read-only or unmanaged files, imports past 4 hops or inside code blocks, rules with `paths:`, drift between unrelated or identical files, scripts outside the home folder, saving the plugins list, archiving a live Claude file, deleting a read-only, unmanaged or changed-on-disk file, putting an archived file back over a newer one, a first guidance check reported as a change, being offline reported as a change, and macOS refusing the daily check. The last check confirms this README states the right number of checks.
 
 ## Repository layout
 

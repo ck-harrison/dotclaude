@@ -29,7 +29,7 @@ from typing import Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
 APP_NAME = "DotClaude"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 DOCS = "https://code.claude.com/docs/en/"
 MAX_READ_BYTES = 10 * 1024 * 1024
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -1969,7 +1969,79 @@ def _reviewable_files(env: Env, tree: dict) -> List[dict]:
 
 
 # Claude writes these notes itself, so flagging them "to review" after a guidance change is noise.
-NOT_BEHIND = {"automem_topics", "automem_index", "automem_orphan"}
+NOT_BEHIND = {"automem_topics", "automem_index", "automem_orphan",
+              "user_agent_memory", "proj_agent_memory", "proj_agent_memory_local"}
+# The two general pages (memory, best practices) are about instruction files. A change to them puts
+# only these on the "to review" list; skills, settings and the rest wait for their own page to change.
+GENERAL_PAGE_KINDS = {"user_claude_md", "user_rules", "managed_claude_md", "proj_claude_md",
+                      "proj_dot_claude_md", "proj_local_md", "proj_agents_md", "proj_rules",
+                      "parent_md", "sub_md"}
+
+
+def behind_keys_for(kind: str) -> List[str]:
+    """The benchmark pages whose change should put a file of this kind on the 'to review' list."""
+    keys = guidance_keys_for({kind})
+    return keys if kind in GENERAL_PAGE_KINDS else [k for k in keys if k not in ("memory", "best")]
+
+
+def _change_snippets(env: Env, key: str, limit: int = 8, ctx: int = 6) -> dict:
+    """The changed words of a benchmark page, each with a few words either side, so a small
+    wording change reads as one line instead of a rewritten paragraph."""
+    d = _guidance_dir(env)
+    prev, cur = d / f"{key}.prev.md", d / f"{key}.md"
+    if not prev.is_file() or not cur.is_file():
+        return {"items": [], "more": 0}
+    plain = lambda t: re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", t)   # link text only, no addresses
+    a, b = plain(prev.read_text()).splitlines(), plain(cur.read_text()).splitlines()
+    out: List[dict] = []
+
+    def clip(words, keep_end):
+        return (("… " if len(words) > ctx else "") + " ".join(words[-ctx:])) if keep_end else \
+               (" ".join(words[:ctx]) + (" …" if len(words) > ctx else ""))
+
+    def short(words, n=40):
+        return " ".join(words[:n]) + (" …" if len(words) > n else "")
+
+    total = 0
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if op == "equal":
+            continue
+        old, new = " ".join(a[i1:i2]).split(), " ".join(b[j1:j2]).split()
+        if not old and not new:
+            continue
+        sm = difflib.SequenceMatcher(None, old, new, autojunk=False)
+        if sm.ratio() < 0.6:      # mostly rewritten or moved: word-level pieces would be gibberish
+            found = [{"before": "", "removed": short(old), "added": short(new), "after": ""}]
+        else:
+            found = [{"before": clip(old[:w1], True), "removed": short(old[w1:w2]),
+                      "added": short(new[v1:v2]), "after": clip(old[w2:], False)}
+                     for wop, w1, w2, v1, v2 in sm.get_opcodes() if wop != "equal"]
+        total += len(found)
+        out += found
+    return {"items": out[:limit], "more": max(0, total - limit)}
+
+
+def _changed_lines(env: Env, key: str) -> int:
+    """How many lines differ between the previous and current copy of a benchmark page."""
+    d = _guidance_dir(env)
+    prev, cur = d / f"{key}.prev.md", d / f"{key}.md"
+    if not prev.is_file() or not cur.is_file():
+        return 0
+    diff = difflib.unified_diff(prev.read_text().splitlines(), cur.read_text().splitlines(), n=0)
+    return sum(1 for ln in diff if ln[:1] in "+-" and not ln.startswith(("+++", "---")))
+
+
+def acknowledge_guidance(env: Env) -> dict:
+    """Mark every recorded change as reviewed: files stop showing as behind until a page changes again."""
+    state = _guidance_state(env)
+    n = 0
+    for s in state.values():
+        if s.get("changed") and s.get("acknowledged") != s.get("hash"):
+            s["acknowledged"] = s.get("hash")
+            n += 1
+    if n:
+        atomic_write(_guidance_dir(env) / "state.json", json.dumps(state, indent=2) + "\n")
+    return {"acknowledged": n, **guidance_status(env)}
 
 
 def guidance_status(env: Env) -> dict:
@@ -1983,19 +2055,29 @@ def guidance_status(env: Env) -> dict:
             if g not in ("memory", "best"):     # those two apply to every review; the page says so
                 used[g].add(KINDS[kind]["title"])
     pages = []
+    wu = writeup_status(env)
+    covered_by = {(k, h): w["id"] for w in reversed(wu["list"]) for k, h in w["covers"]}  # newest wins
     for key, (title, url) in GUIDANCE.items():
         s = state.get(key, {})
         pages.append({"key": key, "title": title, "url": url, "checked": s.get("checked"),
                       "first_seen": s.get("first_seen"), "changed": s.get("changed"), "error": s.get("error"),
                       "has_diff": (_guidance_dir(env) / f"{key}.prev.md").is_file(),
+                      "changed_lines": _changed_lines(env, key) if s.get("changed") else 0,
+                      "snippets": _change_snippets(env, key) if s.get("changed") else {"items": [], "more": 0},
+                      "writeup_id": covered_by.get((key, s.get("hash"))) if s.get("changed") else None,
+                      "acknowledged": bool(s.get("changed")) and s.get("acknowledged") == s.get("hash"),
                       "used_for": sorted(used[key])})
+
+    def live_change(k):  # a change you haven't marked as reviewed yet (matched by content, not time)
+        s = state.get(k) or {}
+        return s.get("changed") if s.get("changed") and s.get("acknowledged") != s.get("hash") else None
+
     behind = []
     for it in _reviewable_files(env, tree):
         if it["kind"] in NOT_BEHIND:
             continue
         mtime = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(Path(it["path"]).stat().st_mtime))
-        newer = [k for k in guidance_keys_for({it["kind"]}) if (state.get(k) or {}).get("changed")
-                 and state[k]["changed"] > mtime]
+        newer = [k for k in behind_keys_for(it["kind"]) if live_change(k) and live_change(k) > mtime]
         if newer:
             behind.append({"path": it["path"], "label": tilde(env, it["path"]), "edited": mtime,
                            "pages": [GUIDANCE[k][0] for k in newer],
@@ -2003,7 +2085,7 @@ def guidance_status(env: Env) -> dict:
     behind.sort(key=lambda b: b["latest"], reverse=True)
     checks = [s.get("checked") for s in state.values() if s.get("checked")]
     return {"pages": pages, "behind": behind, "last_check": max(checks) if checks else None,
-            "notify": notify_status(env)}
+            "notify": notify_status(env), "writeup": wu}
 
 
 def guidance_diff(env: Env, key: str) -> dict:
@@ -2018,16 +2100,255 @@ def guidance_diff(env: Env, key: str) -> dict:
     return {"key": key, "title": GUIDANCE[key][0], "url": GUIDANCE[key][1], "diff": diff}
 
 
+# ---- Write-ups: when a page changes, Claude explains what changed and how to adapt ----
+# Only the public page changes are sent (no files of yours), to your own `claude` command with no tools.
+# Each write-up records the page versions it covers, so a page change is written up once.
+
+WRITEUP_TIMEOUT_S = 600
+WRITEUP_MAX_CHARS = 80_000
+WRITEUP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "headline": {"type": "string"},
+        "summary": {"type": "string"},
+        "changes": {"type": "array", "items": {"type": "object", "properties": {
+            "page": {"type": "string"},
+            "topic": {"type": "string"},
+            "kind": {"type": "string", "enum": ["new", "changed", "removed"]},
+            "before": {"type": "string"},
+            "now": {"type": "string"},
+            "why_it_matters": {"type": "string"},
+            "how_to_adapt": {"type": "string"},
+            "impact": {"type": "string", "enum": ["high", "medium", "low"]}},
+            "required": ["page", "topic", "kind", "before", "now", "why_it_matters", "how_to_adapt", "impact"]}},
+        "minor": {"type": "array", "items": {"type": "string"}},
+        "advice": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["headline", "summary", "changes", "minor", "advice"],
+}
+WRITEUP_INSTRUCTIONS = """You explain changes to Anthropic's official Claude Code documentation to people who use Claude Code \
+every day but don't follow the docs closely. Standard input holds, for each page that changed, a diff of the \
+page: lines starting with - were removed, lines starting with + were added. Use only what the diffs show; \
+don't guess at changes they don't contain.
+
+For each meaningful change, give:
+- page: the page key exactly as given in its heading
+- topic: a short name for what changed
+- kind: new (something added), changed (something different now), or removed
+- before: what the page said or recommended before, in plain words (for a new item, say what it didn't cover)
+- now: what it says now
+- why_it_matters: what this changes for someone using Claude Code
+- how_to_adapt: concretely what a user should do differently, if anything (commands, settings or file changes). \
+If nothing needs doing, say so plainly
+- impact: high (people should change how they work or their setup), medium (worth knowing), low (minor)
+
+Put pure rewording, link or formatting fixes in `minor`, one short line each, not in `changes`.
+headline: one sentence on the most important change. summary: two to four sentences overall.
+advice: three to six short points on how users should adapt their approach to get the most out of Claude Code, \
+given these changes taken together. Order changes most important first.
+
+Write in plain, clear English for a non-developer. Be specific: name the command, setting or file. \
+Don't use em dashes. Don't ask questions or offer follow-ups; just return the result."""
+
+
+def _writeups_dir(env: Env) -> Path:
+    return _guidance_dir(env) / "writeups"
+
+
+def list_writeups(env: Env) -> List[dict]:
+    d = _writeups_dir(env)
+    out = []
+    for p in sorted(d.glob("*.json"), reverse=True) if d.is_dir() else []:
+        if p.name == "status.json":
+            continue
+        try:
+            w = json.loads(p.read_text())
+            w["id"] = p.stem
+            out.append(w)
+        except Exception:
+            continue
+    return out
+
+
+def _covered(env: Env) -> set:
+    return {(pg["key"], pg["hash"]) for w in list_writeups(env) for pg in w.get("pages", [])}
+
+
+def pending_writeup_keys(env: Env) -> List[str]:
+    """Pages whose latest change has no write-up yet (and that have an earlier copy to compare)."""
+    state, covered, d = _guidance_state(env), _covered(env), _guidance_dir(env)
+    return [k for k in GUIDANCE if state.get(k, {}).get("changed") and (d / f"{k}.prev.md").is_file()
+            and (k, state[k].get("hash")) not in covered]
+
+
+def _writeup_status_path(env: Env) -> Path:
+    return _writeups_dir(env) / "status.json"
+
+
+def _writeup_lock(env: Env) -> Path:
+    return _writeups_dir(env) / ".running"
+
+
+def _writeup_running(env: Env) -> bool:
+    lock = _writeup_lock(env)
+    try:
+        info = json.loads(lock.read_text())
+    except Exception:
+        return False
+    if time.time() - info.get("started", 0) > WRITEUP_TIMEOUT_S + 60:
+        return False                              # left behind by a crash
+    try:
+        os.kill(int(info.get("pid", 0)), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def build_writeup_input(env: Env, keys: List[str]) -> str:
+    state, d = _guidance_state(env), _guidance_dir(env)
+    parts, budget = [], WRITEUP_MAX_CHARS
+    for k in keys:
+        prev, cur = (d / f"{k}.prev.md").read_text(), (d / f"{k}.md").read_text()
+        diff = "".join(difflib.unified_diff(prev.splitlines(True), cur.splitlines(True), "before", "now", n=3))
+        diff = diff[:max(2000, budget // max(1, len(keys)))]
+        budget -= len(diff)
+        parts.append(f"## Page key: {k}\nTitle: {GUIDANCE[k][0]}\nURL: {GUIDANCE[k][1]}\n"
+                     f"Changed: {state[k].get('changed')}\n\n```diff\n{diff}\n```\n")
+    return "\n".join(parts)
+
+
+def write_up_guidance(env: Env, auto: bool = False) -> dict:
+    """Write up every page change that hasn't been written up yet. Blocks until done (run it in a thread
+    from the app). With auto=True it skips a set of changes that already failed once, so a broken
+    `claude` command isn't retried on every start; the Try again button passes auto=False."""
+    keys = pending_writeup_keys(env)
+    if not keys:
+        return {"made": None, "reason": "nothing new"}
+    state = _guidance_state(env)
+    hashes = sorted(f"{k}:{state[k].get('hash')}" for k in keys)
+    d = _writeups_dir(env)
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        last = json.loads(_writeup_status_path(env).read_text())
+    except Exception:
+        last = {}
+    if auto and last.get("failed_for") == hashes:
+        return {"made": None, "reason": "failed before"}
+    if _writeup_running(env):
+        return {"made": None, "reason": "already running"}
+    atomic_write(_writeup_lock(env), json.dumps({"pid": os.getpid(), "started": time.time()}))
+    try:
+        cli = find_claude_cli(env.home)
+        if not cli:
+            raise ApiError(424, "Couldn't find the Claude Code command (`claude`).")
+        cmd = [cli, "-p", WRITEUP_INSTRUCTIONS, "--output-format", "json",
+               "--json-schema", json.dumps(WRITEUP_SCHEMA), "--tools", "",
+               "--strict-mcp-config",          # no MCP servers: their tool lists would cost far more than the job
+               "--permission-mode", "dontAsk", "--no-session-persistence"]
+        workdir = tempfile.mkdtemp(prefix="dotclaude-writeup-")  # empty dir: no project CLAUDE.md gets loaded
+        try:
+            r = subprocess.run(cmd, cwd=workdir, input=build_writeup_input(env, keys), capture_output=True,
+                               text=True, timeout=WRITEUP_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            raise ApiError(504, f"Writing it up took longer than {WRITEUP_TIMEOUT_S // 60} minutes and was stopped.")
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+        try:
+            data = json.loads(r.stdout)
+        except Exception:
+            raise ApiError(502, f"Claude Code didn't return a result (exit code {r.returncode}). "
+                                + (r.stderr or r.stdout or "").strip()[-400:])
+        if isinstance(data, list):
+            data = next((x for x in reversed(data) if isinstance(x, dict) and x.get("type") == "result"), {})
+        so = data.get("structured_output")
+        if r.returncode != 0 or data.get("is_error") or not isinstance(so, dict):
+            raise ApiError(502, "The write-up didn't complete: " + str(data.get("result") or r.stderr or "").strip()[-400:])
+        order = {"high": 0, "medium": 1, "low": 2}
+        changes = [c for c in so.get("changes", []) if isinstance(c, dict) and c.get("page") in keys]
+        changes.sort(key=lambda c: order.get(c.get("impact"), 3))
+        w = {"created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+             "pages": [{"key": k, "title": GUIDANCE[k][0], "url": GUIDANCE[k][1], "hash": state[k].get("hash"),
+                        "changed": state[k].get("changed")} for k in keys],
+             "headline": str(so.get("headline", "")), "summary": str(so.get("summary", "")), "changes": changes,
+             "minor": [str(m) for m in so.get("minor", [])], "advice": [str(a) for a in so.get("advice", [])],
+             "cost_usd": data.get("total_cost_usd")}
+        wid = time.strftime("%Y%m%d-%H%M%S")
+        atomic_write(d / f"{wid}.json", json.dumps(w, indent=2) + "\n")
+        atomic_write(_writeup_status_path(env), json.dumps({"ok": wid}) + "\n")
+        return {"made": wid}
+    except ApiError as e:
+        atomic_write(_writeup_status_path(env), json.dumps({"error": e.msg, "failed_for": hashes,
+                                                            "at": time.strftime("%Y-%m-%dT%H:%M:%S")}) + "\n")
+        return {"made": None, "error": e.msg}
+    finally:
+        _writeup_lock(env).unlink(missing_ok=True)
+
+
+def writeup_status(env: Env) -> dict:
+    """For the page: is one being written, did the last attempt fail, what's waiting, which exist."""
+    try:
+        last = json.loads(_writeup_status_path(env).read_text())
+    except Exception:
+        last = {}
+    pending = pending_writeup_keys(env)
+    return {"running": _writeup_running(env), "busy": STARTUP_BUSY.is_set(),
+            "pending": [GUIDANCE[k][0] for k in pending],
+            "error": last.get("error") if pending else None,
+            "list": [{"id": w["id"], "created": w.get("created"), "headline": w.get("headline", ""),
+                      "summary": w.get("summary", ""), "pages": [p["title"] for p in w.get("pages", [])],
+                      "covers": [[p["key"], p["hash"]] for p in w.get("pages", [])]} for w in list_writeups(env)]}
+
+
+def get_writeup(env: Env, wid: str) -> dict:
+    if not re.fullmatch(r"\d{8}-\d{6}", wid or ""):
+        raise ApiError(400, "Bad write-up id.")
+    p = _writeups_dir(env) / f"{wid}.json"
+    if not p.is_file():
+        raise ApiError(404, "No such write-up.")
+    w = json.loads(p.read_text())
+    w["id"] = wid
+    return w
+
+
+def start_writeup(env: Env, auto: bool) -> dict:
+    """Start a write-up in the background if there's anything to write up; return the status at once."""
+    started = bool(pending_writeup_keys(env)) and not _writeup_running(env)
+    if started:
+        threading.Thread(target=lambda: write_up_guidance(env, auto=auto), daemon=True).start()
+    st = writeup_status(env)
+    if started:
+        st.update(running=True, error=None)
+    return st
+
+
+def check_and_write_up(env: Env) -> dict:
+    """Check now (the button); if anything changed, start writing it up in the background."""
+    res = check_guidance(env)
+    wu = start_writeup(env, auto=True)
+    return {**res, **guidance_status(env), "writeup": wu}
+
+
 def maybe_check_guidance(env: Env) -> None:
-    """On app start: re-check in the background if the last check is old."""
+    """On app start: re-check in the background if the last check is old, then write up any new changes."""
     st = _guidance_state(env)
     last = max((s.get("checked") or "" for s in st.values()), default="")
     try:
         age = time.time() - time.mktime(time.strptime(last, "%Y-%m-%dT%H:%M:%S")) if last else None
     except ValueError:
         age = None
-    if age is None or age > GUIDANCE_STALE_S:
-        threading.Thread(target=lambda: check_guidance(env), daemon=True).start()
+
+    def run():
+        STARTUP_BUSY.set()
+        try:
+            if age is None or age > GUIDANCE_STALE_S:
+                check_guidance(env)
+            write_up_guidance(env, auto=True)
+        finally:
+            STARTUP_BUSY.clear()
+    threading.Thread(target=run, daemon=True).start()
+
+
+STARTUP_BUSY = threading.Event()   # the start-up check is still going, so the page should look again soon
 
 
 # ---- macOS notifications: a LaunchAgent runs `dotclaude.py --check-guidance --notify` daily ----
@@ -2084,7 +2405,9 @@ def notification_text(env: Env, result: dict) -> Optional[str]:
     names = [GUIDANCE[k][0] for k in result["changed"]]
     behind = guidance_status(env)["behind"]
     msg = "Updated: " + ", ".join(names) + "."
-    if behind:
+    if result.get("writeup"):
+        msg += " Open DotClaude to read what changed and how to adapt."
+    elif behind:
         msg += f" {len(behind)} of your files predate it. Open DotClaude to review."
     return msg
 
@@ -2114,6 +2437,7 @@ class ReviewJobs:
     def _run(self, job, cli, instructions, payload, model):
         cmd = [cli, "-p", instructions, "--output-format", "json", "--json-schema", json.dumps(REVIEW_SCHEMA),
                "--tools", "WebFetch,WebSearch", "--allowedTools", "WebFetch,WebSearch",
+               "--strict-mcp-config",          # no MCP servers: their tool lists cost a lot and a review needs none
                "--permission-mode", "dontAsk", "--no-session-persistence"]
         if model:
             cmd += ["--model", model]
@@ -2201,6 +2525,9 @@ class ReviewJobs:
             atomic_write(d / name, json.dumps(self.public(job), indent=2))
         except Exception:
             pass
+
+    def running(self) -> bool:
+        return any(j["status"] == "running" for j in self.jobs.values())
 
     def cancel(self, jid: str) -> dict:
         job = self.jobs.get(jid)
@@ -2306,6 +2633,10 @@ def make_handler(env: Env, token: str, port_ref: dict):
                 self._run(lambda: list_tidy(env))
             elif u.path == "/api/guidance":
                 self._run(lambda: guidance_status(env))
+            elif u.path == "/api/version":
+                self._run(version_status)
+            elif u.path == "/api/guidance/writeup":
+                self._run(lambda: get_writeup(env, (q.get("id") or [""])[0]))
             elif u.path == "/api/guidance/diff":
                 self._run(lambda: guidance_diff(env, (q.get("key") or [""])[0]))
             elif u.path == "/api/file":
@@ -2326,6 +2657,12 @@ def make_handler(env: Env, token: str, port_ref: dict):
                 threading.Timer(0.3, port_ref["server"].shutdown).start()
                 return {"ok": True}
 
+            def request_restart():
+                if jobs.running():
+                    raise ApiError(409, "A review is running. Cancel it or wait before restarting.")
+                port_ref["restart"] = True
+                return request_shutdown()
+
             routes = {
                 "/api/save": lambda: save_file(env, body.get("path", ""), body.get("content", ""), body.get("mtime"),
                                                bool(body.get("force"))),
@@ -2337,13 +2674,16 @@ def make_handler(env: Env, token: str, port_ref: dict):
                 "/api/pick-folder": pick_folder,
                 "/api/reveal": lambda: reveal(env, body.get("path", "")),
                 "/api/shutdown": request_shutdown,
+                "/api/restart": request_restart,
                 "/api/backups/restore": lambda: restore_backup(env, body.get("id", ""), body.get("mtime")),
                 "/api/review/start": lambda: jobs.start(body.get("path"), body.get("group"), body.get("model") or None),
                 "/api/review/cancel": lambda: jobs.cancel(body.get("id", "")),
                 "/api/tidy/archive": lambda: archive_strays(env, body.get("paths")),
                 "/api/tidy/restore": lambda: restore_archived(env, body.get("id", "")),
                 "/api/delete": lambda: delete_file(env, body.get("path", ""), body.get("mtime")),
-                "/api/guidance/check": lambda: {**check_guidance(env), **guidance_status(env)},
+                "/api/guidance/check": lambda: check_and_write_up(env),
+                "/api/guidance/writeup": lambda: start_writeup(env, auto=False),
+                "/api/guidance/ack": lambda: acknowledge_guidance(env),
                 "/api/notify": lambda: set_notify(env, bool(body.get("on"))),
                 "/api/review/apply": lambda: apply_rewrite(env, body.get("path", ""), body.get("content", ""),
                                                            body.get("base_mtime")),
@@ -2354,6 +2694,22 @@ def make_handler(env: Env, token: str, port_ref: dict):
             self._run(fn)
 
     return H
+
+
+def _code_sig(path: Path = None):
+    """Size and modification time of this script, to tell when it's been updated since it started."""
+    try:
+        st = (path or Path(__file__).resolve()).stat()
+        return [st.st_mtime_ns, st.st_size]
+    except OSError:
+        return None
+
+
+CODE_AT_START = _code_sig()
+
+
+def version_status() -> dict:
+    return {"version": APP_VERSION, "updated": _code_sig() != CODE_AT_START}
 
 
 def start_server(env: Env, port: int = 0, token: Optional[str] = None):
@@ -2371,6 +2727,7 @@ def start_server(env: Env, port: int = 0, token: Optional[str] = None):
         raise SystemExit(f"Couldn't open a port: {last_err}")
     port_ref["port"] = srv.server_address[1]
     port_ref["server"] = srv
+    srv.port_ref = port_ref
     srv.stopped = threading.Event()
 
     def serve():
@@ -2597,7 +2954,17 @@ if mode == "fail":
     print("Invalid API key · Please run /login", file=sys.stderr); sys.exit(1)
 if mode == "nostruct":
     print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "I could not comply"})); sys.exit(0)
-target = os.environ["FAKE_TARGET"]; other = os.environ["FAKE_OTHER"]; js = os.environ["FAKE_JSON"]
+if "headline" in " ".join(args):     # a guidance write-up
+    import re
+    keys = re.findall(r"^## Page key: (\S+)", stdin, re.M)
+    ch = [{"page": k, "topic": "T " + k, "kind": "changed", "before": "old way", "now": "new way",
+           "why_it_matters": "w", "how_to_adapt": "do x", "impact": "low"} for k in keys]
+    ch.append({"page": "not-a-page", "topic": "invented", "kind": "new", "before": "", "now": "", "why_it_matters": "",
+               "how_to_adapt": "", "impact": "high"})
+    ch[0]["impact"] = "medium"
+    print(json.dumps({"type": "result", "is_error": False, "total_cost_usd": 0.02, "structured_output":
+        {"headline": "H", "summary": "S", "changes": ch, "minor": ["typo"], "advice": ["adapt"]}})); sys.exit(0)
+target =os.environ["FAKE_TARGET"]; other = os.environ["FAKE_OTHER"]; js = os.environ["FAKE_JSON"]
 so = {"summary": "Mostly fine.", "sources_checked": [{"title": "Memory", "url": "https://code.claude.com/docs/en/memory.md", "fetched": True},
                                                       {"title": "Hooks", "url": "https://code.claude.com/docs/en/hooks-guide.md", "fetched": False}],
       "findings": [{"file": target, "severity": "low", "issue": "Too vague", "recommendation": "Be specific",
@@ -2635,6 +3002,8 @@ print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "re
         a_ = lg["args"]
         check("CLI gets only WebFetch/WebSearch tools",
               a_[a_.index("--tools") + 1] == "WebFetch,WebSearch" and "Read" not in " ".join(a_))
+        check("CLI loads no MCP servers (their tool lists would cost far more than the review)",
+              "--strict-mcp-config" in a_)
         check("CLI runs in dontAsk mode", a_[a_.index("--permission-mode") + 1] == "dontAsk")
         check("CLI gets the JSON schema", json.loads(a_[a_.index("--json-schema") + 1])["required"])
         check("prompt names official guidance URLs", "code.claude.com/docs/en/memory.md" in a_[1]
@@ -2975,6 +3344,82 @@ print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "re
                   [p["key"] for p in st2["pages"]].index("settings")]["changed"])
         g4 = check_guidance(env2, fetch=lambda url: "tiny")
         check("guidance: a near-empty page counts as a failure, not a change", g4["changed"] == [] and g4["failed"])
+        check_guidance(env2, fetch=fake)
+        check("guidance: size of a change is counted (1 line out, 1 in)",
+              next(p for p in guidance_status(env2)["pages"] if p["key"] == "settings")["changed_lines"] == 2)
+        ak = acknowledge_guidance(env2)
+        check("guidance: mark as reviewed clears the list", ak["acknowledged"] == 1 and ak["behind"] == []
+              and next(p for p in ak["pages"] if p["key"] == "settings")["acknowledged"])
+        check("guidance: marking twice changes nothing", acknowledge_guidance(env2)["acknowledged"] == 0)
+        pages[set_url] = pages[set_url].replace("guidance line\n", "SECOND RULE\n", 1)
+        check_guidance(env2, fetch=fake)
+        check("guidance: a later change brings files back, even within the same second",
+              str(c2 / "settings.json") in {b["path"] for b in guidance_status(env2)["behind"]})
+        acknowledge_guidance(env2)
+        sk2 = c2 / "skills" / "deploy" / "SKILL.md"
+        sk2.parent.mkdir(parents=True, exist_ok=True)
+        sk2.write_text("---\nname: deploy\ndescription: Deploy the app\n---\nRun the deploy.\n")
+        for f in (sk2, c2 / "CLAUDE.md", c2 / "settings.json"):
+            os.utime(f, (old_mtime, old_mtime))
+        mem_url = GUIDANCE["memory"][1]
+        pages[mem_url] = pages[mem_url].replace("guidance line\n", "run the context command to check\n", 1)
+        check_guidance(env2, fetch=fake)
+        pages[mem_url] = pages[mem_url].replace("run the context command to check",
+                                                "run the context all command to check")
+        check_guidance(env2, fetch=fake)
+        st5 = guidance_status(env2)
+        behind5 = {b["path"] for b in st5["behind"]}
+        check("guidance: a change to the CLAUDE.md page flags instruction files", str(c2 / "CLAUDE.md") in behind5)
+        check("guidance: ...but not skills or settings", str(sk2) not in behind5
+              and str(c2 / "settings.json") not in behind5)
+        sn = next(p for p in st5["pages"] if p["key"] == "memory")["snippets"]
+        check("guidance: the change is shown word by word, with context",
+              len(sn["items"]) == 1 and sn["items"][0]["removed"] == "" and sn["items"][0]["added"] == "all"
+              and sn["items"][0]["before"].endswith("the context") and sn["items"][0]["after"].startswith("command"))
+
+        print("Write-ups of guidance changes (fake `claude`)")
+        wlog = td / "fake_wlog.json"
+        os.environ.update({"DOTCLAUDE_CLAUDE_BIN": str(td / "fake_claude.py"), "FAKE_LOG": str(wlog), "FAKE_MODE": "ok"})
+        pend = pending_writeup_keys(env2)
+        check("write-up: changed pages are waiting", set(pend) == {"memory", "settings"})
+        wr = write_up_guidance(env2, auto=True)
+        w1 = get_writeup(env2, wr["made"] or "00000000-000000")
+        sent = json.loads(wlog.read_text())
+        check("write-up: made and saved", w1["headline"] == "H" and w1["advice"] == ["adapt"]
+              and {p["key"] for p in w1["pages"]} == {"memory", "settings"})
+        check("write-up: sends only the public page changes, with no tools",
+              "## Page key: memory" in sent["stdin"] and "Run the deploy." not in sent["stdin"]
+              and str(h2) not in sent["stdin"] and sent["args"][sent["args"].index("--tools") + 1] == ""
+              and "--strict-mcp-config" in sent["args"])
+        check("write-up: a change for a page it wasn't given is dropped; most important first",
+              all(c["page"] in ("memory", "settings") for c in w1["changes"]) and w1["changes"][0]["impact"] == "medium")
+        check("write-up: pages point to it", all(p["writeup_id"] == wr["made"] for p in guidance_status(env2)["pages"]
+                                               if p["key"] in ("memory", "settings")))
+        wlog.unlink()
+        check("write-up: each change is written up once", write_up_guidance(env2, auto=True)["made"] is None
+              and not wlog.exists())
+        pages[mem_url] = pages[mem_url].replace("guidance line\n", "THIRD RULE\n", 1)
+        check_guidance(env2, fetch=fake)
+        os.environ["FAKE_MODE"] = "fail"
+        wf = write_up_guidance(env2, auto=True)
+        check("write-up: a failure is reported, not hidden", wf["made"] is None and "login" in (wf.get("error") or "")
+              and "login" in (writeup_status(env2)["error"] or ""))
+        os.environ["FAKE_MODE"] = "ok"
+        check("write-up: a failed change isn't retried automatically", write_up_guidance(env2, auto=True).get("reason") == "failed before")
+        wr2 = write_up_guidance(env2, auto=False)
+        check("write-up: Try again works, and covers only the new change",
+              wr2["made"] and [p["key"] for p in get_writeup(env2, wr2["made"])["pages"]] == ["memory"]
+              and writeup_status(env2)["error"] is None)
+        check("write-up: the notification points to it",
+              "how to adapt" in (notification_text(env2, {"changed": ["memory"], "writeup": wr2["made"]}) or ""))
+        try:
+            get_writeup(env2, "../state")
+            check("write-up: a bad id is refused", False)
+        except ApiError as e:
+            check("write-up: a bad id is refused", e.status == 400)
+        for k in ("DOTCLAUDE_CLAUDE_BIN", "FAKE_MODE", "FAKE_LOG"):
+            os.environ.pop(k, None)
+        acknowledge_guidance(env2)
         ran = []
         ns = set_notify(env2, True, run=lambda a: (ran.append(a), type("R", (), {"returncode": 0, "stderr": ""})())[1])
         plist = _launch_agent_path(env2).read_text()
@@ -3012,6 +3457,14 @@ print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "re
         check("/health refuses a foreign Host", call("GET", "/health", tok=None, host="evil.com")[0] == 403)
         check("/health leaks nothing private", set(hj) == {"app", "version", "url"})
         check("shutdown needs the token", call("POST", "/api/shutdown", {}, tok=None)[0] == 403)
+        check("restart needs the token", call("POST", "/api/restart", {}, tok=None)[0] == 403)
+        global CODE_AT_START
+        saved_sig = CODE_AT_START
+        check("version: not flagged as updated while the script is unchanged",
+              call("GET", "/api/version")[1] == {"version": APP_VERSION, "updated": False})
+        CODE_AT_START = [0, 0]                       # as if dotclaude.py changed after this copy started
+        check("version: an updated script is flagged", call("GET", "/api/version")[1]["updated"] is True)
+        CODE_AT_START = saved_sig
         old, new = td / "mig/.claude-files", td / "mig/.dotclaude"
         (old / "backups").mkdir(parents=True)
         (old / "config.json").write_text('{"extra_folders": ["/x"]}')
@@ -3060,6 +3513,10 @@ def main():
         res = check_guidance(env)
         print(time.strftime("%Y-%m-%d %H:%M"), "checked", len(GUIDANCE), "pages; changed:",
               ", ".join(res["changed"]) or "none", "; failed:", ", ".join(res["failed"]) or "none")
+        if pending_writeup_keys(env):
+            wu = write_up_guidance(env, auto=True)
+            print("  write-up:", wu.get("made") or wu.get("error") or wu.get("reason"))
+            res["writeup"] = wu.get("made")
         msg = notification_text(env, res)
         if msg and args.notify:
             notify_mac("Claude Code best practice changed", msg)
@@ -3077,6 +3534,15 @@ def main():
     except KeyboardInterrupt:
         print("\nStopped.")
         srv.shutdown()
+        return
+    if srv.port_ref.get("restart"):
+        # Restart in place on the same port, running the updated script. The page reloads itself.
+        srv.server_close()
+        argv = [sys.executable, str(Path(__file__).resolve()), "--no-browser", "--port", str(port)]
+        if args.home:
+            argv += ["--home", args.home]
+        print("Restarting with the updated version.", flush=True)
+        os.execv(sys.executable, argv)
 
 
 PAGE = r"""<!doctype html>
@@ -3224,7 +3690,18 @@ details.more[open] > summary { margin-bottom: 10px; }
 .att-text details { margin-top: 8px; }
 .att-text details > summary { cursor: pointer; font-size: 13px; color: var(--accent); }
 .att-text details .list { margin-top: 8px; }
-.att-row > .btn { flex: none; }
+.wu-ba { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 10px 0; }
+.wu-ba > div { background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+.wu-ba h5 { margin: 0 0 4px; font-size: 12px; color: var(--muted); font-weight: 600; }
+.wu-ba p { margin: 0; }
+@media (max-width: 700px) { .wu-ba { grid-template-columns: 1fr; } }
+.wu-advice { margin: 0; padding-left: 20px; } .wu-advice li { margin: 4px 0; }
+.snips { margin: 8px 0 0; font-size: 13px; }
+.snips h5 { margin: 10px 0 4px; font-size: 13px; }
+.snips p { margin: 0 0 6px; color: var(--muted); overflow-wrap: anywhere; }
+.snips del { color: var(--err); background: color-mix(in srgb, var(--err) 12%, transparent); padding: 0 2px; border-radius: 3px; }
+.snips ins { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); padding: 0 2px; border-radius: 3px; text-decoration: none; }
+.att-btns { display: flex; gap: 6px; flex: none; }
 .welcome h2 { font-size: 24px; }
 .welcome ol { padding-left: 20px; }
 .welcome li { margin: 4px 0; }
@@ -3244,6 +3721,8 @@ dialog .acts { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wr
 .rv-btn { border: 1px solid var(--accent); color: var(--accent); background: var(--panel); border-radius: 7px; padding: 5px 12px; font-size: 13px; font-weight: 600; }
 .rv-btn:hover { background: var(--sel); }
 .rv-btn:disabled { opacity: .5; cursor: default; }
+#upd-banner { display: none; margin-top: 8px; font-size: 12px; background: color-mix(in srgb, var(--warn) 14%, transparent); border-radius: 7px; padding: 8px 10px; line-height: 1.45; }
+#upd-banner .btn { display: block; margin-top: 6px; font-size: 12px; padding: 3px 10px; }
 #rv-banner { display: none; margin-top: 8px; font-size: 12px; background: var(--sel); border-radius: 7px; padding: 6px 10px; cursor: pointer; }
 #rv-banner.show { display: block; }
 .rv-card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-bottom: 12px; }
@@ -3254,7 +3733,12 @@ dialog .acts { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wr
 @media (prefers-color-scheme: dark) { .sev.high { background: #4c1d1d; color: #fca5a5; } .sev.medium { background: #4a3510; color: #fcd34d; } }
 .rv-meta { font-size: 12px; color: var(--faint); }
 .rv-file { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--muted); cursor: pointer; text-decoration: underline dotted; }
-pre.diff { background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 10px; font-size: 12px; overflow: auto; max-height: 420px; margin: 8px 0; }
+pre.diff { background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 10px; font-size: 12px; overflow: auto; max-height: 420px; margin: 8px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+pre.diff span { display: block; }
+.key { padding: 0 5px; border-radius: 4px; font-weight: 600; }
+.key.a { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); }
+.key.d { color: var(--err); background: color-mix(in srgb, var(--err) 12%, transparent); }
+pre.diff .a { background: color-mix(in srgb, var(--ok) 10%, transparent); } pre.diff .d { background: color-mix(in srgb, var(--err) 10%, transparent); }
 pre.diff .a { color: var(--ok); } pre.diff .d { color: var(--err); } pre.diff .h { color: var(--faint); }
 .load-total { display: flex; align-items: baseline; gap: 10px; margin: 6px 0 10px; }
 .load-total b { font-size: 22px; }
@@ -3292,6 +3776,7 @@ pre.diff .a { color: var(--ok); } pre.diff .d { color: var(--err); } pre.diff .h
       <span><button class="mini" id="refresh" title="Rescan">↻ Rescan</button> <button class="mini" id="stop" title="Stop DotClaude">⏻ Stop</button></span>
     </div>
     <div id="rv-banner"></div>
+    <div id="upd-banner"><b>DotClaude has been updated.</b> You're running the old version. <button class="btn" id="upd-restart">Restart now</button></div>
   </header>
   <nav id="nav"></nav>
 </aside>
@@ -3389,7 +3874,7 @@ function renderGroup(nav, g, q) {
   }).filter(Boolean);
   if (q && !vis.length) return;
 
-  const closedDefault = g.collapsed || (g.scope === "project" && tree.projects.length > 3);
+  const closedDefault = g.collapsed || g.scope === "global" || (g.scope === "project" && tree.projects.length > 3);
   const closed = q ? false : (S.closed[g.id] ?? closedDefault);
   const wrap = document.createElement("div");
   wrap.className = "grp" + (closed ? " closed" : "");
@@ -3663,7 +4148,7 @@ function entryHtml(it, missing = false) {
   const n = it.type === "folder" ? it.children.length : 0;
   const preview = n ? it.children.slice(0, 3).map(ch => ch.label.replace(/\/SKILL\.md$|\.md$/, "")).join(", ") + (n > 3 ? `, and ${n - 3} more` : "") : "";
   const dot = missing ? `<span class="dot hollow"></span>` : it.type === "folder" ? `<span class="count">${n}</span>` : `<span class="dot${it.readonly ? " ro" : ""}"></span>`;
-  const right = missing ? `<span class="why-line">${md(k.why)}</span>` : `<span class="when">${esc(k.loads)}</span>`;
+  const right = missing ? `<span class="why-line">${md(k.why)}</span>` : `<span class="when">${md(k.loads)}</span>`;
   return `<button data-entry="${esc(entryKey(it))}">${dot}<span class="ent"><span><b>${esc(k.short || it.label)}</b> ${isFileName(it.label) ? `<span class="fname">${esc(it.label)}</span>` : ""}${it.readonly ? ` <span class="badge">read-only</span>` : ""}</span>${preview ? `<span class="preview">${esc(preview)}</span>` : ""}</span>${right}</button>`;
 }
 /* Files genuinely worth adding: an instructions file where there's none, and shared settings. */
@@ -3726,7 +4211,7 @@ function welcome() {
     <h2>DotClaude</h2>
     <p class="lede">Every file Claude Code reads on this Mac: ${files} file${files === 1 ? "" : "s"} across ${tree.projects.length} project${tree.projects.length === 1 ? "" : "s"}. Pick one on the left to read or edit it. Every save keeps a backup of the old version.</p>
     <h3 class="sec">Needs your attention</h3>
-    ${att.length ? `<div class="list att">${att.map((a, i) => `<div class="att-row"><div class="att-text">${a.html}${a.detail ? `<details><summary>${esc(a.detailLabel)}</summary>${a.detail}</details>` : ""}</div>${a.btn ? `<button class="btn" data-att="${i}">${esc(a.btn)}</button>` : ""}</div>`).join("")}</div>`
+    ${att.length ? `<div class="list att">${att.map((a, i) => `<div class="att-row"><div class="att-text">${a.html}${a.detail ? `<details${a.detailOpen ? " open" : ""}><summary>${esc(a.detailLabel)}</summary>${a.detail}</details>` : ""}</div>${a.btn || a.btn2 ? `<div class="att-btns">${a.btn ? `<button class="btn" data-att="${i}">${esc(a.btn)}</button>` : ""}${a.btn2 ? `<button class="btn" data-att2="${i}">${esc(a.btn2)}</button>` : ""}</div>` : ""}</div>`).join("")}</div>`
       : `<p class="lede">${loading ? "Checking…" : "Nothing needs your attention."}</p>`}
     <details class="more"><summary>How Claude Code reads these files</summary>
     <div class="legend"><span><span class="dot"></span> exists</span><span><span class="dot ro"></span> read-only</span><span><span class="dot hollow"></span> missing (shown when <b>Show missing files</b> is ticked)</span></div>
@@ -3749,17 +4234,106 @@ function welcome() {
   </section></div>`;
   const c = $("#content");
   c.querySelectorAll("[data-att]").forEach(b => b.onclick = () => att[+b.dataset.att].go());
+  c.querySelectorAll("[data-att2]").forEach(b => b.onclick = () => att[+b.dataset.att2].go2());
   c.querySelectorAll("[data-goto]").forEach(b => b.onclick = e => { e.preventDefault(); const g = tree.projects.find(p => p.id === b.dataset.goto); if (g) openGroup(g); });
   if (DRIFT && DRIFT.pairs.length) wireDrift(c, DRIFT.pairs);
+  wireWriteupRetry(c);
+}
+
+/* ---------------- Write-ups of guidance changes ---------------- */
+function wireWriteupRetry(root) {
+  root.querySelectorAll("[data-wu-retry]").forEach(a => a.onclick = async e => {
+    e.preventDefault();
+    try { const st = await api("POST", "/api/guidance/writeup"); GUIDE.writeup = st; onExtras(); if (sel === "guidance") renderGuidance(GUIDE); watchWriteup(); }
+    catch (err) { toast(err.message, 4500); }
+  });
+}
+let wuTimer = null;
+/* Only while a write-up is being written: look every 5 seconds, stop as soon as it's done. */
+function watchWriteup() {
+  clearTimeout(wuTimer);
+  if (!GUIDE || !GUIDE.writeup || !(GUIDE.writeup.running || GUIDE.writeup.busy)) return;
+  wuTimer = setTimeout(async () => {
+    let g; try { g = await api("GET", "/api/guidance"); } catch (e) { return watchWriteup(); }
+    const was = GUIDE.writeup.list.length;
+    GUIDE = g; onExtras();
+    if (sel === "guidance") renderGuidance(g);
+    if (g.writeup.running || g.writeup.busy) return watchWriteup();
+    if (g.writeup.list.length > was) toast("The write-up of Anthropic's changes is ready", 4000);
+    else if (g.writeup.error) toast("Couldn't write up the changes", 4000);
+  }, 5000);
+}
+const codeTxt = s => esc(s || "").replace(/`([^`]+)`/g, "<code>$1</code>");
+const IMPACT = { high: "Change how you work", medium: "Worth knowing", low: "Minor" };
+async function openWriteup(id) {
+  if (!(await guardDirty())) return;
+  cur = null; markSel("guidance");
+  const c = $("#content");
+  c.innerHTML = `<div class="crumbs">Tools › Best-practice benchmark</div><h2>What changed in Anthropic's guidance</h2><div id="wu">Loading…</div>`;
+  let w;
+  try { w = await api("GET", "/api/guidance/writeup?id=" + encodeURIComponent(id)); } catch (e) { $("#wu").textContent = e.message; return; }
+  const t = codeTxt;
+  const title = k => (w.pages.find(p => p.key === k) || {}).title || k;
+  $("#wu").innerHTML = `<p class="rv-meta">Written ${esc(fmtTime(w.created))} from the changes to ${w.pages.map(p => `<a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.title)}</a>`).join(", ")}.</p>
+    <div class="rv-card"><p><b>${t(w.headline)}</b></p><p>${t(w.summary)}</p></div>
+    ${w.advice.length ? `<h3 style="margin:22px 0 8px">How to adapt</h3><div class="rv-card"><ul class="wu-advice">${w.advice.map(a => `<li>${t(a)}</li>`).join("")}</ul></div>` : ""}
+    <h3 style="margin:22px 0 8px">The changes (${w.changes.length})</h3>
+    ${w.changes.map(ch => `<div class="rv-card wu-change"><h4><span class="sev ${esc(ch.impact)}">${esc(IMPACT[ch.impact] || ch.impact)}</span>${t(ch.topic)}</h4>
+      <p class="rv-meta">${esc(title(ch.page))} · ${ch.kind === "new" ? "New" : ch.kind === "removed" ? "Removed" : "Changed"}</p>
+      <div class="wu-ba"><div><h5>Before</h5><p>${t(ch.before)}</p></div><div><h5>Now</h5><p>${t(ch.now)}</p></div></div>
+      <p><b>Why it matters:</b> ${t(ch.why_it_matters)}</p><p><b>What to do:</b> ${t(ch.how_to_adapt)}</p></div>`).join("") || `<div class="rv-card">No changes of substance, only the small edits below.</div>`}
+    ${w.minor.length ? `<details style="margin-top:14px"><summary class="rv-meta" style="cursor:pointer">Small wording and link fixes (${w.minor.length})</summary><ul>${w.minor.map(m => `<li class="rv-meta">${t(m)}</li>`).join("")}</ul></details>` : ""}
+    <p class="rv-meta" style="margin-top:18px">Claude wrote this from the page changes alone, using your <code>claude</code> command. Check anything important against the official page. <a href="#" id="wu-diff">See the exact changes</a></p>`;
+  $("#wu-diff").onclick = e => { e.preventDefault(); openGuidance(w.pages[0] && w.pages[0].key); };
+}
+
+async function ackGuidance() {
+  const live = GUIDE ? GUIDE.pages.filter(p => p.changed && !p.acknowledged) : [];
+  const a = await ask({ title: "Mark the guidance changes as reviewed?", text: `${GUIDE.behind.length ? `Your ${GUIDE.behind.length} file(s) stop showing as out of date` : "The changes stop showing on Home"} until Anthropic changes ${live.length === 1 ? "that page" : "one of these pages"} again. Nothing in your files changes, and the write-up stays on the benchmark page.`, buttons: [{ label: "Cancel", value: null }, { label: "Mark as reviewed", value: "go", primary: true }] });
+  if (!a || a.value !== "go") return;
+  try {
+    GUIDE = await api("POST", "/api/guidance/ack");
+    toast("Marked as reviewed");
+    renderNav();
+    if (sel === "guidance") renderGuidance(GUIDE); else welcome();
+  } catch (e) { toast(e.message, 4500); }
 }
 async function goHome() { if (await guardDirty()) { if (cur) cur.dirty = false; welcome(); } }
+
+/* The changed words of each page, with a little context: red was removed, green was added. */
+function snippetsHtml(pages) {
+  const t = s => esc(s.replace(/\*\*/g, "")).replace(/`([^`]+)`/g, "<code>$1</code>");
+  const SHOW = 4;
+  return `<div class="snips">${pages.map(p => {
+    const all = p.snippets || { items: [], more: 0 };
+    const sn = { items: all.items.slice(0, SHOW), more: all.more + Math.max(0, all.items.length - SHOW) };
+    const n = GUIDE.behind.filter(b => b.pages.includes(p.title)).length;
+    return `<h5>${esc(p.title)} <span class="rv-meta" style="display:inline;font-weight:400">affects ${n} of your file${n === 1 ? "" : "s"}</span></h5>` +
+      sn.items.map(s => `<p>${t(s.before)} ${s.removed ? `<del>${t(s.removed)}</del>` : ""} ${s.added ? `<ins>${t(s.added)}</ins>` : ""} ${t(s.after)}</p>`).join("") +
+      (sn.more ? `<p>and ${sn.more} more change${sn.more === 1 ? "" : "s"}: see <b>Full page changes</b>.</p>` : "");
+  }).join("")}<p class="rv-meta" style="margin-top:8px"><del>Red</del> was removed, <ins>green</ins> was added.</p></div>`;
+}
 
 /* Everything worth a look, in one list. Each item: html, optional button + action, optional expandable detail. */
 function attentionItems() {
   if (!tree) return [];
   const out = [];
   const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
-  if (GUIDE && GUIDE.behind.length) out.push({ html: `<b>${plural(GUIDE.behind.length, "file was", "files were")} last edited before Anthropic changed its guidance.</b><span class="rv-meta">Worth a review against the new version.</span>`, btn: "See which", go: () => openGuidance() });
+  const live = GUIDE && GUIDE.pages ? GUIDE.pages.filter(p => p.changed && !p.acknowledged) : [];
+  if (live.length) {
+    const lines = live.reduce((n, p) => n + (p.changed_lines || 0), 0);
+    const W = GUIDE.writeup || { list: [] };
+    const ids = [...new Set(live.map(p => p.writeup_id).filter(Boolean))];
+    const w = W.list.find(x => x.id === ids.sort().reverse()[0]);
+    const head = GUIDE.behind.length ? `${plural(GUIDE.behind.length, "file was", "files were")} last edited before Anthropic changed its guidance.` : "Anthropic changed its guidance.";
+    const status = W.running ? `<span class="rv-meta"><span class="spinner"></span> Claude is writing up what changed and how to adapt. This takes a minute or two.</span>`
+      : W.error ? `<span class="rv-meta" style="color:var(--err)">Couldn't write up the changes: ${esc(W.error)} <a href="#" data-wu-retry>Try again</a></span>` : "";
+    out.push({ html: `<b>${head}</b>` + (w ? `<span class="rv-meta"><b style="color:var(--ink)">${codeTxt(w.headline)}</b> ${codeTxt(w.summary)}</span>` : "")
+        + `<span class="rv-meta">${plural(live.length, "page", "pages")} changed (${esc(live.map(p => p.title).join(", "))}), ${plural(lines, "line", "lines")} in all.${w ? "" : " Read the changes below; if none of them affect you, mark them as reviewed."}</span>` + status,
+      detailLabel: "The changes, word by word", detailOpen: !w, detail: snippetsHtml(live),
+      btn: w ? "Read the write-up" : "Full page changes", go: () => w ? openWriteup(w.id) : openGuidance(),
+      btn2: "Mark as reviewed", go2: () => ackGuidance() });
+  }
   if (DRIFT && DRIFT.pairs.length) out.push({ html: `<b>${plural(DRIFT.pairs.length, "pair of files has", "pairs of files have")} drifted apart.</b><span class="rv-meta">Each pair looks like one set of instructions kept under two names, such as CLAUDE.md and AGENTS.md, but they no longer match, so different tools get different instructions.</span>`, detailLabel: "Show them", detail: driftListHtml(DRIFT.pairs) });
   const bare = tree.projects.filter(g => suggestions(g).some(it => it.kind === "proj_claude_md"));
   if (bare.length) out.push({ html: `<b>${plural(bare.length, "project has", "projects have")} no instructions file.</b><span class="rv-meta">Claude starts every session there without knowing how to build or test: ${bare.map(g => `<a href="#" data-goto="${esc(g.id)}">${esc(g.title)}</a>`).join(", ")}.</span>` });
@@ -3832,7 +4406,7 @@ async function openGuidance(showKey) {
   if (!(await guardDirty())) return;
   cur = null; markSel("guidance");
   const c = $("#content");
-  c.innerHTML = `<div class="crumbs">This Mac</div><h2>Best-practice benchmark</h2>
+  c.innerHTML = `<div class="crumbs">Tools</div><h2>Best-practice benchmark</h2>
     <div class="note"><b>What your files are judged against.</b> When you click <b>✦ Review against best practice</b>, DotClaude asks Claude Code to read the official Anthropic pages below, fresh at that moment, and to judge your files only against them. Every finding has to cite one of these pages; advice that no page supports is dropped. A review only uses the pages that apply to the files being reviewed (the "Used for" column).</div>
     <div id="gd">Loading…</div>`;
   let g;
@@ -3845,7 +4419,7 @@ function renderGuidance(g, showKey) {
   const n = g.notify;
   const pageRows = g.pages.map(p => `<div class="tidy-row"><span class="lab"><a href="${esc(p.url)}" target="_blank" rel="noopener"><b>${esc(p.title)}</b> ↗</a><br>
       <span class="rv-meta">Used for: ${esc(p.used_for.join(", ") || "every review")}</span><br>
-      <span class="rv-meta">${p.error ? `<span style="color:var(--err)">Last check failed: ${esc(p.error)}</span>` : p.changed ? `<b style="color:var(--warn)">Changed ${esc(fmtTime(p.changed))}</b>` : p.first_seen ? `No change since DotClaude started tracking it (${esc(fmtTime(p.first_seen))})` : "Not checked yet"}</span></span>
+      <span class="rv-meta">${p.error ? `<span style="color:var(--err)">Last check failed: ${esc(p.error)}</span>` : p.changed ? (p.acknowledged ? `Changed ${esc(fmtTime(p.changed))} (${p.changed_lines} line${p.changed_lines === 1 ? "" : "s"}), marked as reviewed` : `<b style="color:var(--warn)">Changed ${esc(fmtTime(p.changed))}: ${p.changed_lines} line${p.changed_lines === 1 ? "" : "s"}</b>`) : p.first_seen ? `No change since DotClaude started tracking it (${esc(fmtTime(p.first_seen))})` : "Not checked yet"}</span></span>
       ${p.has_diff ? `<button class="btn" data-diff="${esc(p.key)}">What changed</button>` : ""}</div>`).join("");
   box.innerHTML = `
     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px">
@@ -3853,12 +4427,15 @@ function renderGuidance(g, showKey) {
       <span class="rv-meta">${g.last_check ? "Last checked " + esc(fmtTime(g.last_check)) : "Never checked"}. DotClaude can only see changes from its first check onward.</span>
     </div>
     <div class="list" style="margin-bottom:14px"><label class="tidy-row" style="cursor:pointer"><input type="checkbox" id="gnotify" ${n.on ? "checked" : ""}><span class="lab"><b>Notify me when these pages change</b><br><span class="rv-meta">A Mac notification after a daily check at ${esc(n.time)}, even when DotClaude isn't open. Log: <code>${esc(n.log)}</code></span></span></label></div>
-    ${g.behind.length ? `<h4 style="margin:18px 0 8px">Files last edited before the guidance changed (${g.behind.length})</h4><div class="list">${g.behind.map((b, i) => `<div class="tidy-row"><span class="lab"><span class="mono">${esc(b.label)}</span><br><span class="rv-meta">Edited ${esc(fmtTime(b.edited))} · ${esc(b.pages.join(", "))} changed ${esc(fmtTime(b.latest))}</span></span><button class="btn" data-open="${i}">Open</button></div>`).join("")}</div>` : ""}
+    ${writeupsHtml(g.writeup)}
+    ${g.behind.length ? `<h4 style="margin:18px 0 8px">Files last edited before the guidance changed (${g.behind.length})</h4>
+      <div class="actions" style="margin-bottom:10px"><button class="btn" id="gack">Mark as reviewed</button><span class="rv-meta">Read <b>What changed</b> on the pages below first. If none of it affects your files, this clears the list until a page changes again. Editing or reviewing a file also clears it.</span></div>
+      <div class="list">${g.behind.map((b, i) => `<div class="tidy-row"><span class="lab"><span class="mono">${esc(b.label)}</span><br><span class="rv-meta">Edited ${esc(fmtTime(b.edited))} · ${esc(b.pages.join(", "))} changed ${esc(fmtTime(b.latest))}</span></span><button class="btn" data-open="${i}">Open</button></div>`).join("")}</div>` : ""}
     <h4 style="margin:18px 0 8px">The official pages (${g.pages.length})</h4><div class="list">${pageRows}</div>
     <div id="gdiff"></div>`;
   $("#gcheck").onclick = async () => {
     $("#gcheck").disabled = true; $("#gcheck").textContent = "Checking…";
-    try { const r = await api("POST", "/api/guidance/check"); GUIDE = r; renderNav(); markSel("guidance"); renderGuidance(r);
+    try { const r = await api("POST", "/api/guidance/check"); GUIDE = r; renderNav(); markSel("guidance"); renderGuidance(r); watchWriteup();
       toast(r.changed.length ? `${r.changed.length} page${r.changed.length === 1 ? "" : "s"} changed` : r.failed.length ? `${r.failed.length} page(s) couldn't be loaded` : "No changes", 3500); }
     catch (e) { toast(e.message, 4000); $("#gcheck").disabled = false; $("#gcheck").textContent = "Check for updates now"; }
   };
@@ -3868,7 +4445,19 @@ function renderGuidance(g, showKey) {
   };
   box.querySelectorAll("[data-open]").forEach(b => b.onclick = () => { const it = findItem(g.behind[+b.dataset.open].path); if (it) openFile(it); });
   box.querySelectorAll("[data-diff]").forEach(b => b.onclick = () => showGuidanceDiff(b.dataset.diff));
+  const ack = $("#gack", box); if (ack) ack.onclick = () => ackGuidance();
+  box.querySelectorAll("[data-wu]").forEach(b => b.onclick = () => openWriteup(b.dataset.wu));
+  wireWriteupRetry(box);
   if (showKey) showGuidanceDiff(showKey);
+}
+function writeupsHtml(W) {
+  if (!W) return "";
+  const st = W.running ? `<div class="tidy-row"><span class="lab"><span class="spinner"></span> Claude is writing up the latest changes (${esc(W.pending.join(", "))}).</span></div>`
+    : W.error ? `<div class="tidy-row"><span class="lab"><span style="color:var(--err)">Couldn't write up the changes to ${esc(W.pending.join(", "))}: ${esc(W.error)}</span></span><a href="#" class="btn" data-wu-retry>Try again</a></div>`
+    : W.pending.length ? `<div class="tidy-row"><span class="lab">Not written up yet: ${esc(W.pending.join(", "))}</span><a href="#" class="btn" data-wu-retry>Write it up</a></div>` : "";
+  if (!st && !W.list.length) return "";
+  return `<h4 style="margin:18px 0 4px">What changed, written up</h4><p class="rv-meta" style="margin:0 0 8px">When a page changes, Claude explains what it said before, what it says now, and how to adapt. It sends only the public page changes, through your own <code>claude</code> command, once per change.</p>
+    <div class="list">${st}${W.list.map(w => `<div class="tidy-row"><span class="lab"><b>${esc(w.headline || "Write-up")}</b><br><span class="rv-meta">${esc(fmtTime(w.created))}: ${esc(w.pages.join(", "))}</span></span><button class="btn" data-wu="${esc(w.id)}">Read</button></div>`).join("")}</div>`;
 }
 
 async function showGuidanceDiff(key) {
@@ -3922,7 +4511,7 @@ async function showBackup(id, it) {
   const canRestore = managed && !managed.readonly;
   v.innerHTML = `<div class="rv-card"><h4>${esc(fmtTime(b.time))}</h4>
     <p class="rv-meta">${esc(b.label)} · ${fmtSize(b.size)}</p>
-    ${b.same_as_current ? `<p>This is identical to the current file.</p>` : b.current_exists ? `<details open><summary style="cursor:pointer;font-size:13px">Changes from the current file to this version</summary><pre class="diff">${diffHtml(b.diff)}</pre></details>` : `<p>The file doesn't exist any more. Restoring recreates it.</p>`}
+    ${b.same_as_current ? `<p>This is identical to the current file.</p>` : b.current_exists ? `<details open><summary style="cursor:pointer;font-size:13px">How this version differs from the file now</summary><p class="rv-meta" style="margin:6px 0 0"><span class="key d">Red</span> is in the file now but not in this version. <span class="key a">Green</span> is in this version but not in the file now. Restoring brings back the green and removes the red.</p><pre class="diff">${diffHtml(b.diff)}</pre></details>` : `<p>The file doesn't exist any more. Restoring recreates it.</p>`}
     <details><summary style="cursor:pointer;font-size:13px">Full text of this version</summary><pre class="diff">${esc(b.content)}</pre></details>
     <p style="margin-top:12px">${b.same_as_current ? "" : canRestore ? `<button class="btn primary" id="restore">Restore this version</button> <span class="rv-meta">The current version is backed up first, so you can undo this.</span>` : `<span class="rv-meta">${managed ? "This file is read-only in DotClaude." : "This file is no longer one DotClaude manages, so it can't be restored here. You can copy the text above."}</span>`}</p></div>`;
   const r = $("#restore");
@@ -3945,7 +4534,7 @@ async function openAllBackups() {
   if (!(await guardDirty())) return;
   cur = null; markSel("backups");
   const c = $("#content");
-  c.innerHTML = `<div class="crumbs">This Mac</div><h2>Backups</h2><div id="all">Loading…</div>`;
+  c.innerHTML = `<div class="crumbs">Tools</div><h2>Backups</h2><div id="all">Loading…</div>`;
   let data;
   try { data = await api("GET", "/api/backups"); } catch (e) { $("#all").textContent = e.message; return; }
   if (!data.count) { $("#all").innerHTML = `<div class="note">No backups yet. DotClaude saves one every time you save a file, apply a review suggestion, or restore a version.</div>`; return; }
@@ -4006,7 +4595,7 @@ function updateBanner() {
 }
 const fmtSecs = s => s < 60 ? s + "s" : Math.floor(s / 60) + "m " + (s % 60) + "s";
 async function showReview() { if (!RV) return; if (!(await guardDirty())) return; cur = null; markSel("review"); renderReview(); }
-function diffHtml(d) { return d.split("\n").map(l => `<span class="${l.startsWith("+++") || l.startsWith("---") || l.startsWith("@@") ? "h" : l.startsWith("+") ? "a" : l.startsWith("-") ? "d" : ""}">${esc(l)}</span>`).join("\n"); }
+function diffHtml(d) { return d.split("\n").map(l => `<span class="${l.startsWith("+++") || l.startsWith("---") || l.startsWith("@@") ? "h" : l.startsWith("+") ? "a" : l.startsWith("-") ? "d" : ""}">${esc(l) || " "}</span>`).join(""); }
 function fileLabel(p) { const it = findItem(p); return it ? (groupOf(it).title + " › " + it.label) : tilde(p); }
 
 function renderReview() {
@@ -4074,7 +4663,7 @@ let DRIFT = null, TIDY = null, GUIDE = null;  // filled in the background after 
 async function load() {
   tree = await api("GET", "/api/tree"); renderNav();
   DRIFT = null; TIDY = null;
-  api("GET", "/api/guidance").then(g => { GUIDE = g; onExtras(); }).catch(() => { GUIDE = { behind: [] }; onExtras(); });
+  api("GET", "/api/guidance").then(g => { GUIDE = g; onExtras(); watchWriteup(); }).catch(() => { GUIDE = { behind: [] }; onExtras(); });
   api("GET", "/api/drift").then(d => { DRIFT = d; onExtras(); }).catch(() => { DRIFT = { pairs: [] }; onExtras(); });
   api("GET", "/api/tidy").then(t => { TIDY = t; onExtras(); }).catch(() => { TIDY = { strays: [], archived: [] }; onExtras(); });
 }
@@ -4099,6 +4688,25 @@ $("#stop").onclick = async () => {
   document.body.innerHTML = `<div style="margin:auto;text-align:center;color:var(--muted)"><h2 style="color:var(--ink)">DotClaude has stopped</h2><p>You can close this tab.</p></div>`;
 };
 $("#home-link").onclick = goHome;
+
+/* Has dotclaude.py changed since this copy started? Checked on load and when you come back to the tab. */
+async function checkUpdated() {
+  try { const v = await api("GET", "/api/version"); $("#upd-banner").style.display = v.updated ? "block" : "none"; } catch (e) {}
+}
+window.addEventListener("focus", checkUpdated);
+$("#upd-restart").onclick = async () => {
+  if (RV && RV.status === "running") { toast("A review is running. Cancel it or wait before restarting."); return; }
+  if (!(await guardDirty())) return;
+  const b = $("#upd-restart"); b.disabled = true; b.textContent = "Restarting…";
+  try { await api("POST", "/api/restart"); } catch (e) { toast(e.message, 4500); b.disabled = false; b.textContent = "Restart now"; return; }
+  if (cur) cur.dirty = false;
+  for (let i = 0; i < 40; i++) {          // up to 20 seconds for the new version to answer
+    await new Promise(r => setTimeout(r, 500));
+    try { const r = await fetch("/health"); if (r.ok) { location.reload(); return; } } catch (e) {}
+  }
+  b.textContent = "Couldn't restart. Open it again from the Dock.";
+};
+checkUpdated();
 document.addEventListener("keydown", e => {
   if ((e.metaKey || e.ctrlKey) && e.key === "s") { e.preventDefault(); save(); }
   if ((e.metaKey || e.ctrlKey) && e.key === "k") { e.preventDefault(); $("#search").focus(); $("#search").select(); }
